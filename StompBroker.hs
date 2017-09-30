@@ -27,13 +27,13 @@ socketLoop sock = do
 handleConnection :: Handle -> IO ()
 handleConnection handle = do
     hSetBuffering handle NoBuffering
-    processConnectFrame handle
+    processFrames handle
 
-
-processConnectFrame :: Handle -> IO ()
-processConnectFrame handle = do
+processFrames :: Handle -> IO ()
+processFrames handle = do
     frame <- parseFrame handle
-    IO.putStrLn (show frame)
+    IO.putStrLn $ show frame
+    processFrames handle
 
 parseFrame :: Handle -> IO Frame
 parseFrame handle = do
