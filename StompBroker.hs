@@ -70,20 +70,11 @@ maybeMax :: Ord a => [a] -> Maybe a
 maybeMax [] = Nothing
 maybeMax xs = Just (List.maximum xs)
 
-processFrames :: Handle -> IO ()
-processFrames handle = do
-    frame <- parseFrame handle
-    IO.putStrLn $ show frame
-    processFrames handle
-
 supportedVersions :: [String]
 supportedVersions = ["1.2"]
 
-intercalcate :: String -> [String] -> String
-intercalcate separator strings  = List.concat (List.intersperse separator strings)
-
 supportedVersionsAsString :: String
-supportedVersionsAsString = intercalcate ", " supportedVersions
+supportedVersionsAsString = List.intercalate ", " supportedVersions
 
 handleFrame :: Handle -> Frame -> IO ()
 handleFrame handle frame = do
