@@ -42,8 +42,12 @@ handleNewConnection handle frame = let version = determineVersion frame in
 connectionLoop :: Handle -> IO ()
 connectionLoop handle = do
     frame <- parseFrame handle
-    handleFrame handle frame
-    connectionLoop handle
+    handleReceiptRequest handle frame
+    case (getCommand frame) of
+        DISCONNECT -> do 
+            hClose handle
+            return ()
+        _ -> connectionLoop handle
 
 sendConnectedResponse :: Handle -> String -> IO ()
 sendConnectedResponse handle version = let response = connected version in
@@ -76,11 +80,12 @@ supportedVersions = ["1.2"]
 supportedVersionsAsString :: String
 supportedVersionsAsString = List.intercalate ", " supportedVersions
 
-handleFrame :: Handle -> Frame -> IO ()
-handleFrame handle frame = do
+handleReceiptRequest :: Handle -> Frame -> IO ()
+handleReceiptRequest handle frame = do
     case (getReceipt frame) of
         Just receiptId -> sendReceipt handle receiptId
         _ -> return ()
+
 
 sendReceipt :: Handle -> String -> IO ()
 sendReceipt handle receiptId = do
