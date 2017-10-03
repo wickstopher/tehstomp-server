@@ -78,4 +78,10 @@ supportedVersionsAsString = List.intercalate ", " supportedVersions
 
 handleFrame :: Handle -> Frame -> IO ()
 handleFrame handle frame = do
-    IO.putStrLn (show frame)
+    case (getReceipt frame) of
+        Just receiptId -> sendReceipt handle receiptId
+        _ -> return ()
+
+sendReceipt :: Handle -> String -> IO ()
+sendReceipt handle receiptId = do
+    hPut handle $ frameToBytes (receipt receiptId)
