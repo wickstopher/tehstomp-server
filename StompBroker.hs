@@ -3,51 +3,66 @@ import Data.ByteString as BS
 import Data.List as List
 import Stomp.Frames.IO
 import Network.Socket
+import Prelude hiding (log)
 import System.IO as IO
 import Stomp.Frames
+import Stomp.TLogger
 
 main :: IO ()
 main = do
+    console <- dateTimeLogger stdout
     sock <- socket AF_INET Stream 0
     setSocketOption sock ReuseAddr 1
     bind sock (SockAddrInet 2323 iNADDR_ANY)
     listen sock 5
-    IO.putStrLn "STOMP broker initiated on port 2323"
-    socketLoop sock
+    log console "STOMP broker initiated on port 2323"
+    socketLoop sock console
 
-socketLoop :: Socket -> IO ()
-socketLoop sock = do
+socketLoop :: Socket -> Logger -> IO ()
+socketLoop sock console = do
     (uSock, _) <- accept sock
+    addr <- getPeerName uSock
+    log console $ "New connection received from " ++ (show addr)
     handle <- socketToHandle uSock ReadWriteMode
-    forkIO (negotiateConnection handle)
-    socketLoop sock
+    forkIO $ negotiateConnection handle (addTransform (stringTransform ("[" ++ show addr ++ "]")) console)
+    socketLoop sock console
 
-negotiateConnection :: Handle -> IO ()
-negotiateConnection handle = do
+negotiateConnection :: Handle -> Logger -> IO ()
+negotiateConnection handle console = do
     hSetBuffering handle NoBuffering
     frame <- parseFrame handle
     case (getCommand frame) of
-        STOMP   -> handleNewConnection handle frame
-        CONNECT -> handleNewConnection handle frame
-        _       -> rejectConnection handle "Please initiate communications with a connection request"
+        STOMP   -> do
+            log console "STOMP frame received; negotiating new connection"
+            handleNewConnection handle frame console
+        CONNECT -> do
+            log console "CONNECT frame received; negotiating new connection"
+            handleNewConnection handle frame console
+        _       -> do
+            log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
+            rejectConnection handle "Please initiate communications with a connection request"
     
-handleNewConnection :: Handle -> Frame -> IO ()
-handleNewConnection handle frame = let version = determineVersion frame in
+handleNewConnection :: Handle -> Frame -> Logger -> IO ()
+handleNewConnection handle frame console = let version = determineVersion frame in
     case version of
         Just v  -> do 
             sendConnectedResponse handle v
-            connectionLoop handle
-        Nothing -> rejectConnection handle ("Supported STOMP versions are: " ++  supportedVersionsAsString)
+            log console $ "Connection initiated to client using STOMP protocol version " ++ v
+            connectionLoop handle console
+        Nothing -> do
+            log console "No common protocol versions supported; rejecting connection"
+            rejectConnection handle ("Supported STOMP versions are: " ++  supportedVersionsAsString)
 
-connectionLoop :: Handle -> IO ()
-connectionLoop handle = do
+connectionLoop :: Handle -> Logger -> IO ()
+connectionLoop handle console = do
     frame <- parseFrame handle
     handleReceiptRequest handle frame
     case (getCommand frame) of
         DISCONNECT -> do 
+            log console "Disconnect request received; closing connection to client"
             hClose handle
             return ()
-        _ -> connectionLoop handle
+        _ -> connectionLoop handle console
 
 sendConnectedResponse :: Handle -> String -> IO ()
 sendConnectedResponse handle version = let response = connected version in
@@ -90,3 +105,8 @@ handleReceiptRequest handle frame = do
 sendReceipt :: Handle -> String -> IO ()
 sendReceipt handle receiptId = do
     hPut handle $ frameToBytes (receipt receiptId)
+
+stringTransform :: String -> IO String -> IO String
+stringTransform string ioString = do
+    s' <- ioString
+    return $ string ++ " " ++ s'
