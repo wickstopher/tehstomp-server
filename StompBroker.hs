@@ -56,7 +56,8 @@ handleNewConnection handle frame console = let version = determineVersion frame 
 connectionLoop :: Handle -> Logger -> IO ()
 connectionLoop handle console = do
     frame <- parseFrame handle
-    handleReceiptRequest handle frame
+    log console $ "Received " ++ (show $ getCommand frame) ++ " frame"
+    handleReceiptRequest handle frame console
     case (getCommand frame) of
         DISCONNECT -> do 
             log console "Disconnect request received; closing connection to client"
@@ -95,12 +96,13 @@ supportedVersions = ["1.2"]
 supportedVersionsAsString :: String
 supportedVersionsAsString = List.intercalate ", " supportedVersions
 
-handleReceiptRequest :: Handle -> Frame -> IO ()
-handleReceiptRequest handle frame = do
+handleReceiptRequest :: Handle -> Frame -> Logger -> IO ()
+handleReceiptRequest handle frame console = do
     case (getReceipt frame) of
-        Just receiptId -> sendReceipt handle receiptId
+        Just receiptId -> do
+            log console $ "Sending receipt for message with receipt ID: " ++ receiptId
+            sendReceipt handle receiptId
         _ -> return ()
-
 
 sendReceipt :: Handle -> String -> IO ()
 sendReceipt handle receiptId = do
