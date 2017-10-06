@@ -2,7 +2,7 @@ import Control.Concurrent
 import Data.ByteString as BS
 import Data.List as List
 import Stomp.Frames.IO
-import Network.Socket
+import Network.Socket hiding (close)
 import Prelude hiding (log)
 import System.IO as IO
 import Stomp.Frames
@@ -24,55 +24,56 @@ socketLoop sock console = do
     addr <- getPeerName uSock
     log console $ "New connection received from " ++ (show addr)
     handle <- socketToHandle uSock ReadWriteMode
-    forkIO $ negotiateConnection handle (addTransform (stringTransform ("[" ++ show addr ++ "]")) console)
+    hSetBuffering handle NoBuffering
+    frameHandler <- initFrameHandler handle
+    forkIO $ negotiateConnection frameHandler (addTransform (stringTransform ("[" ++ show addr ++ "]")) console)
     socketLoop sock console
 
-negotiateConnection :: Handle -> Logger -> IO ()
-negotiateConnection handle console = do
-    hSetBuffering handle NoBuffering
-    frame <- parseFrame handle
+negotiateConnection :: FrameHandler -> Logger -> IO ()
+negotiateConnection frameHandler console = do
+    frame <- get frameHandler
     case (getCommand frame) of
         STOMP   -> do
             log console "STOMP frame received; negotiating new connection"
-            handleNewConnection handle frame console
+            handleNewConnection frameHandler frame console
         CONNECT -> do
             log console "CONNECT frame received; negotiating new connection"
-            handleNewConnection handle frame console
+            handleNewConnection frameHandler frame console
         _       -> do
             log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
-            rejectConnection handle "Please initiate communications with a connection request"
+            rejectConnection frameHandler "Please initiate communications with a connection request"
     
-handleNewConnection :: Handle -> Frame -> Logger -> IO ()
-handleNewConnection handle frame console = let version = determineVersion frame in
+handleNewConnection :: FrameHandler -> Frame -> Logger -> IO ()
+handleNewConnection frameHandler frame console = let version = determineVersion frame in
     case version of
         Just v  -> do 
-            sendConnectedResponse handle v
+            sendConnectedResponse frameHandler v
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
-            connectionLoop handle console
+            connectionLoop frameHandler console
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
-            rejectConnection handle ("Supported STOMP versions are: " ++  supportedVersionsAsString)
+            rejectConnection frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
 
-connectionLoop :: Handle -> Logger -> IO ()
-connectionLoop handle console = do
-    frame <- parseFrame handle
+connectionLoop :: FrameHandler -> Logger -> IO ()
+connectionLoop frameHandler console = do
+    frame <- get frameHandler
     log console $ "Received " ++ (show $ getCommand frame) ++ " frame"
-    handleReceiptRequest handle frame console
+    handleReceiptRequest frameHandler frame console
     case (getCommand frame) of
         DISCONNECT -> do 
             log console "Disconnect request received; closing connection to client"
-            hClose handle
+            close frameHandler
             return ()
-        _ -> connectionLoop handle console
+        _ -> connectionLoop frameHandler console
 
-sendConnectedResponse :: Handle -> String -> IO ()
-sendConnectedResponse handle version = let response = connected version in
-    do hPut handle $ frameToBytes response
+sendConnectedResponse :: FrameHandler -> String -> IO ()
+sendConnectedResponse frameHandler version = let response = connected version in
+    do put frameHandler response
 
-rejectConnection :: Handle -> String -> IO ()
-rejectConnection handle message = let response = errorFrame message in
-    do  hPut handle $ frameToBytes response
-        hClose handle
+rejectConnection :: FrameHandler -> String -> IO ()
+rejectConnection frameHandler message = let response = errorFrame message in
+    do  put frameHandler response
+        close frameHandler
 
 determineVersion :: Frame -> Maybe String
 determineVersion frame = 
@@ -96,17 +97,17 @@ supportedVersions = ["1.2"]
 supportedVersionsAsString :: String
 supportedVersionsAsString = List.intercalate ", " supportedVersions
 
-handleReceiptRequest :: Handle -> Frame -> Logger -> IO ()
-handleReceiptRequest handle frame console = do
+handleReceiptRequest :: FrameHandler -> Frame -> Logger -> IO ()
+handleReceiptRequest frameHandler frame console = do
     case (getReceipt frame) of
         Just receiptId -> do
             log console $ "Sending receipt for message with receipt ID: " ++ receiptId
-            sendReceipt handle receiptId
+            sendReceipt frameHandler receiptId
         _ -> return ()
 
-sendReceipt :: Handle -> String -> IO ()
-sendReceipt handle receiptId = do
-    hPut handle $ frameToBytes (receipt receiptId)
+sendReceipt :: FrameHandler -> String -> IO ()
+sendReceipt frameHandler receiptId = do
+    put frameHandler $ receipt receiptId
 
 stringTransform :: String -> IO String -> IO String
 stringTransform string ioString = do
