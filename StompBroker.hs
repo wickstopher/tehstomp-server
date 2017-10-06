@@ -5,18 +5,25 @@ import Stomp.Frames.IO
 import Network.Socket hiding (close)
 import Prelude hiding (log)
 import System.IO as IO
+import System.Environment
 import Stomp.Frames
 import Stomp.TLogger
 
 main :: IO ()
 main = do
+    args <- getArgs
+    port <- processArgs args
     console <- dateTimeLogger stdout
     sock <- socket AF_INET Stream 0
     setSocketOption sock ReuseAddr 1
-    bind sock (SockAddrInet 2323 iNADDR_ANY)
+    bind sock (SockAddrInet port iNADDR_ANY)
     listen sock 5
-    log console "STOMP broker initiated on port 2323"
+    log console $ "STOMP broker initiated on port " ++ (show port)
     socketLoop sock console
+
+processArgs :: [String] -> IO PortNumber
+processArgs (s:[]) = return $ fromIntegral ((read s)::Int)
+processArgs _      = return 2323
 
 socketLoop :: Socket -> Logger -> IO ()
 socketLoop sock console = do
