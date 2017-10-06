@@ -70,8 +70,17 @@ connectionLoop frameHandler console = do
         DISCONNECT -> do 
             log console "Disconnect request received; closing connection to client"
             close frameHandler
-            return ()
-        _ -> connectionLoop frameHandler console
+        SEND       -> handleSendFrame frame console
+        _          -> log console "Handler not yet implemented"
+    connectionLoop frameHandler console
+
+handleSendFrame :: Frame -> Logger -> IO ()
+handleSendFrame frame console = case getDestination frame of
+    Just destination -> do
+        log console $ "Message destination: " ++ destination
+        log console $ "Message contents: " ++ (show $ getBody frame)
+    Nothing -> log console "No destination specified in SEND frame"
+
 
 sendConnectedResponse :: FrameHandler -> String -> IO ()
 sendConnectedResponse frameHandler version = let response = connected version in
