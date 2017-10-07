@@ -8,6 +8,7 @@ import System.IO as IO
 import System.Environment
 import Stomp.Frames
 import Stomp.TLogger
+import Subscription
 
 main :: IO ()
 main = do
@@ -19,50 +20,50 @@ main = do
     bind sock (SockAddrInet port iNADDR_ANY)
     listen sock 5
     log console $ "STOMP broker initiated on port " ++ (show port)
-    socketLoop sock console
+    socketLoop sock console initSubscriptions
 
 processArgs :: [String] -> IO PortNumber
 processArgs (s:[]) = return $ fromIntegral ((read s)::Int)
 processArgs _      = return 2323
 
-socketLoop :: Socket -> Logger -> IO ()
-socketLoop sock console = do
+socketLoop :: Socket -> Logger -> Subscriptions -> IO ()
+socketLoop sock console subs = do
     (uSock, _) <- accept sock
     addr <- getPeerName uSock
     log console $ "New connection received from " ++ (show addr)
     handle <- socketToHandle uSock ReadWriteMode
     hSetBuffering handle NoBuffering
     frameHandler <- initFrameHandler handle
-    forkIO $ negotiateConnection frameHandler (addTransform (stringTransform ("[" ++ show addr ++ "]")) console)
-    socketLoop sock console
+    forkIO $ negotiateConnection frameHandler (addTransform (stringTransform ("[" ++ show addr ++ "]")) console) subs
+    socketLoop sock console subs
 
-negotiateConnection :: FrameHandler -> Logger -> IO ()
-negotiateConnection frameHandler console = do
+negotiateConnection :: FrameHandler -> Logger -> Subscriptions -> IO ()
+negotiateConnection frameHandler console subs = do
     frame <- get frameHandler
     case (getCommand frame) of
         STOMP   -> do
             log console "STOMP frame received; negotiating new connection"
-            handleNewConnection frameHandler frame console
+            handleNewConnection frameHandler frame console subs
         CONNECT -> do
             log console "CONNECT frame received; negotiating new connection"
-            handleNewConnection frameHandler frame console
+            handleNewConnection frameHandler frame console subs
         _       -> do
             log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
             rejectConnection frameHandler "Please initiate communications with a connection request"
     
-handleNewConnection :: FrameHandler -> Frame -> Logger -> IO ()
-handleNewConnection frameHandler frame console = let version = determineVersion frame in
+handleNewConnection :: FrameHandler -> Frame -> Logger -> Subscriptions -> IO ()
+handleNewConnection frameHandler frame console subs = let version = determineVersion frame in
     case version of
         Just v  -> do 
             sendConnectedResponse frameHandler v
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
-            connectionLoop frameHandler console
+            connectionLoop frameHandler console subs
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
 
-connectionLoop :: FrameHandler -> Logger -> IO ()
-connectionLoop frameHandler console = do
+connectionLoop :: FrameHandler -> Logger -> Subscriptions -> IO ()
+connectionLoop frameHandler console subs = do
     frame <- get frameHandler
     log console $ "Received " ++ (show $ getCommand frame) ++ " frame"
     handleReceiptRequest frameHandler frame console
@@ -71,8 +72,9 @@ connectionLoop frameHandler console = do
             log console "Disconnect request received; closing connection to client"
             close frameHandler
         SEND       -> handleSendFrame frame console
+        SUBSCRIBE  -> handleSubscriptionRequest frame console subs
         _          -> log console "Handler not yet implemented"
-    connectionLoop frameHandler console
+    connectionLoop frameHandler console subs
 
 handleSendFrame :: Frame -> Logger -> IO ()
 handleSendFrame frame console = case getDestination frame of
@@ -80,6 +82,10 @@ handleSendFrame frame console = case getDestination frame of
         log console $ "Message destination: " ++ destination
         log console $ "Message contents: " ++ (show $ getBody frame)
     Nothing -> log console "No destination specified in SEND frame"
+
+handleSubscriptionRequest :: Frame -> Logger -> Subscriptions -> IO ()
+handleSubscriptionRequest frame console subs = do
+    
 
 
 sendConnectedResponse :: FrameHandler -> String -> IO ()
