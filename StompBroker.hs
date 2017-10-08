@@ -91,7 +91,8 @@ handleSubscriptionRequest :: FrameHandler -> Frame -> Logger -> Subscriptions ->
 handleSubscriptionRequest handler frame console subs = 
     case getDestination frame of
         Just destination -> let subscriber = Subscriber handler (getAckType $ getAck frame) in do
-                return $ addSubscriber subscriber destination subs
+                subs' <- updateSubs destination subs
+                return $ addSubscriber subscriber destination subs'
         Nothing -> do
             rejectConnection handler "No destination header present in subscription request."
             return $ Just subs
