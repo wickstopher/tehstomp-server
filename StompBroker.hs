@@ -72,7 +72,11 @@ connectionLoop frameHandler console subs = do
             log console "Disconnect request received; closing connection to client"
             close frameHandler
         SEND       -> handleSendFrame frame console
-        SUBSCRIBE  -> handleSubscriptionRequest frame console subs
+        SUBSCRIBE  -> do 
+            updatedSubs <- handleSubscriptionRequest frameHandler frame console subs
+            case updatedSubs of
+                Just subs' -> connectionLoop frameHandler console subs'
+                Nothing    -> rejectConnection frameHandler "There was a problem adding your subscription request"
         _          -> log console "Handler not yet implemented"
     connectionLoop frameHandler console subs
 
@@ -83,10 +87,24 @@ handleSendFrame frame console = case getDestination frame of
         log console $ "Message contents: " ++ (show $ getBody frame)
     Nothing -> log console "No destination specified in SEND frame"
 
-handleSubscriptionRequest :: Frame -> Logger -> Subscriptions -> IO ()
-handleSubscriptionRequest frame console subs = do
-    
+handleSubscriptionRequest :: FrameHandler -> Frame -> Logger -> Subscriptions -> IO (Maybe Subscriptions)
+handleSubscriptionRequest handler frame console subs = 
+    case getDestination frame of
+        Just destination -> let subscriber = Subscriber handler (getAckType $ getAck frame) in do
+                return $ addSubscriber subscriber destination subs
+        Nothing -> do
+            rejectConnection handler "No destination header present in subscription request."
+            return $ Just subs
 
+getAckType :: Maybe String -> AckType
+getAckType (Just "client")             = Client
+getAckType (Just "client-individual)") = ClientIndividual
+getAckType _                           = Auto 
+
+updateSubs :: String -> Subscriptions -> IO Subscriptions
+updateSubs destination subs = case getTopic destination subs of
+    Just topic -> return subs
+    Nothing    -> return $ addTopic destination subs
 
 sendConnectedResponse :: FrameHandler -> String -> IO ()
 sendConnectedResponse frameHandler version = let response = connected version in
