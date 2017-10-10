@@ -7,7 +7,7 @@ import Stomp.Frames.IO
 
 data AckType = Auto | Client | ClientIndividual
 
-data Subscriber = Subscriber FrameHandler AckType
+data Subscriber = Subscriber FrameHandler AckType String
 
 data Topic = Topic String [Subscriber]
 
@@ -24,7 +24,7 @@ sendToAll frame (Topic name (sub:subs)) = do
     sendToAll frame (Topic name subs)
 
 sendToSubscriber :: Frame -> Subscriber -> IO ThreadId
-sendToSubscriber frame (Subscriber handler _) = do
+sendToSubscriber frame (Subscriber handler _ _) = do
     forkIO $ put handler frame
 
 addTopicSubscriber :: Subscriber -> Topic -> Topic

@@ -1,4 +1,5 @@
 import Control.Concurrent
+import Control.Exception
 import Data.ByteString as BS
 import Data.List as List
 import Stomp.Frames.IO
@@ -9,6 +10,16 @@ import System.Environment
 import Stomp.Frames
 import Stomp.TLogger
 import Subscription
+
+data ClientException = NoSubscriptionHeader |
+                       NoDestinationHeader  |
+                       SubscriptionUpdate
+
+instance Exception ClientException
+instance Show ClientException where
+    show NoSubscriptionHeader = "No subscription header present in request"
+    show NoDestinationHeader  = "No destination header present in request"
+    show SubscriptionUpdate   = "There was an error processing the subscription request"
 
 main :: IO ()
 main = do
@@ -64,10 +75,22 @@ handleNewConnection frameHandler frame console subs = let version = determineVer
 
 connectionLoop :: FrameHandler -> Logger -> Subscriptions -> IO ()
 connectionLoop frameHandler console subs = do
+    result <- try (handleNextFrame frameHandler console subs) :: IO (Either SomeException Command)
+    case result of
+        Left exception -> do
+            log console $ "There was an error processing a client frame: " ++ (show exception)
+            rejectConnection frameHandler $ "Error: " ++ (show exception)
+        Right command -> case command of
+            DISCONNECT -> return ()
+            _          -> connectionLoop frameHandler console subs
+
+handleNextFrame :: FrameHandler -> Logger -> Subscriptions -> IO Command
+handleNextFrame frameHandler console subs = do 
     frame <- get frameHandler
-    log console $ "Received " ++ (show $ getCommand frame) ++ " frame"
+    command <- return $ getCommand frame
+    log console $ "Received " ++ (show command) ++ " frame"
     handleReceiptRequest frameHandler frame console
-    case (getCommand frame) of
+    case command of
         DISCONNECT -> do 
             log console "Disconnect request received; closing connection to client"
             close frameHandler
@@ -76,9 +99,9 @@ connectionLoop frameHandler console subs = do
             updatedSubs <- handleSubscriptionRequest frameHandler frame console subs
             case updatedSubs of
                 Just subs' -> connectionLoop frameHandler console subs'
-                Nothing    -> rejectConnection frameHandler "There was a problem adding your subscription request"
+                Nothing    -> throw SubscriptionUpdate
         _          -> log console "Handler not yet implemented"
-    connectionLoop frameHandler console subs
+    return command
 
 handleSendFrame :: Frame -> Logger -> IO ()
 handleSendFrame frame console = case getDestination frame of
@@ -90,17 +113,19 @@ handleSendFrame frame console = case getDestination frame of
 handleSubscriptionRequest :: FrameHandler -> Frame -> Logger -> Subscriptions -> IO (Maybe Subscriptions)
 handleSubscriptionRequest handler frame console subs = 
     case getDestination frame of
-        Just destination -> let subscriber = Subscriber handler (getAckType $ getAck frame) in do
+        Just destination -> let subscriber = Subscriber handler (getAckType $ getAck frame) (getSubscriptionId $ getId frame) in do
                 subs' <- updateSubs destination subs
                 return $ addSubscriber subscriber destination subs'
-        Nothing -> do
-            rejectConnection handler "No destination header present in subscription request."
-            return $ Just subs
+        Nothing -> throw NoDestinationHeader
 
 getAckType :: Maybe String -> AckType
 getAckType (Just "client")             = Client
 getAckType (Just "client-individual)") = ClientIndividual
-getAckType _                           = Auto 
+getAckType _                           = Auto
+
+getSubscriptionId :: Maybe String -> String
+getSubscriptionId (Just id) = id
+getSubscriptionId Nothing   = throw NoSubscriptionHeader
 
 updateSubs :: String -> Subscriptions -> IO Subscriptions
 updateSubs destination subs = case getTopic destination subs of
