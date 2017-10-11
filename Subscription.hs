@@ -1,50 +1,83 @@
 module Subscription where
 
 import Control.Concurrent
+import Control.Concurrent.TxEvent
+import Control.Exception
 import Data.HashMap.Strict as HM
+import Data.Unique
 import Stomp.Frames
 import Stomp.Frames.IO
 
-data AckType = Auto | Client | ClientIndividual
+type Dest= String
+type ClientId = Integer
+type SubscriptionId = String
 
-data Subscriber = Subscriber FrameHandler AckType String
+data Client = Client ClientId FrameHandler SubscriptionId
 
-data Topic = Topic String [Subscriber]
+data Topic = Topic (HashMap Integer Client)
 
-type Subscriptions = HashMap String Topic
+data Destinations = Destinations (HashMap Dest Topic)
 
+data Update = Add Client Dest |
+              Remove Client Dest |
+              GotMessage Dest Frame
 
-newTopic :: String -> Topic
-newTopic s = Topic s []
+data SubscriptionNotifier = SubscriptionNotifier (SChan Update)
 
-sendToAll :: Frame -> Topic -> IO ()
-sendToAll _ (Topic _ []) = return ()
-sendToAll frame (Topic name (sub:subs)) = do
-    sendToSubscriber frame sub
-    sendToAll frame (Topic name subs)
+data SubscriptionException = ClientNotSubscribed Dest |
+                             DestinationDoesNotExist Dest
 
-sendToSubscriber :: Frame -> Subscriber -> IO ThreadId
-sendToSubscriber frame (Subscriber handler _ _) = do
-    forkIO $ put handler frame
+instance Exception SubscriptionException
+instance Show SubscriptionException where
+    show (ClientNotSubscribed dest)     = "Client is not subscribed to " ++ dest
+    show (DestinationDoesNotExist dest) = "Destination " ++ dest ++ " does not exist"
 
-addTopicSubscriber :: Subscriber -> Topic -> Topic
-addTopicSubscriber subscriber (Topic name subs) = Topic name (subscriber:subs)
+initNotifier :: IO SubscriptionNotifier
+initNotifier = do
+    updateChan   <- sync newSChan
+    destinations <- return $ Destinations empty
+    forkIO $ notificationLoop updateChan destinations
+    return $ SubscriptionNotifier updateChan
 
-addSubscriber :: Subscriber -> String -> Subscriptions -> Maybe Subscriptions
-addSubscriber subscriber topicName subs = case HM.lookup topicName subs of
-    Just topic -> Just $ HM.insert topicName (addTopicSubscriber subscriber topic) subs
-    Nothing    -> Nothing
+notificationLoop :: SChan Update -> Destinations -> IO ()
+notificationLoop updateChan destinations = do
+    update <- sync $ recvEvt updateChan
+    destinations' <- handleUpdate update destinations
+    notificationLoop updateChan destinations'
 
-initSubscriptions :: Subscriptions
-initSubscriptions = HM.empty
+handleUpdate :: Update -> Destinations -> IO Destinations
+handleUpdate (Add client dest) d@(Destinations topicMap) = 
+    return $ Destinations $ insert dest (addClient d client dest) topicMap
+handleUpdate (Remove client dest) d@(Destinations topicMap) = 
+    return $ Destinations $ insert dest (removeClient d client dest) topicMap
+handleUpdate (GotMessage dest frame) d@(Destinations topicMap) = do
+    case HM.lookup dest topicMap of
+        Just (Topic clientMap) -> sendMessageToClients frame clientMap
+        Nothing                -> throw $ DestinationDoesNotExist dest
+    return d
 
-addTopic :: String -> Subscriptions -> Subscriptions
-addTopic name subs = HM.insert name (newTopic name) subs
+addClient :: Destinations -> Client -> Dest -> Topic
+addClient d@(Destinations topicMap) c@(Client cid _ _) dest =
+    case HM.lookup dest topicMap of
+            Just (Topic clientMap) -> Topic (HM.insert cid c clientMap)
+            Nothing                -> Topic (singleton cid c)
 
-sendToTopic :: Subscriptions -> Frame -> String -> IO ()
-sendToTopic subs frame topicName = case HM.lookup topicName subs of
-    Just topic -> sendToAll frame topic
-    Nothing    -> return ()
+removeClient :: Destinations -> Client -> Dest -> Topic
+removeClient d@(Destinations topicMap) c@(Client cid _ _) dest =
+    case HM.lookup dest topicMap of
+        Just (Topic clientMap) -> Topic (HM.delete cid clientMap)
+        Nothing                -> throw $ ClientNotSubscribed dest
 
-getTopic :: String -> Subscriptions -> Maybe Topic
-getTopic topicName subs = HM.lookup topicName subs
+sendMessageToClients :: Frame -> (HashMap Integer Client) -> IO ()
+sendMessageToClients frame clientMap = mapM_ (sendMessage frame) clientMap
+
+sendMessage :: Frame -> Client -> IO ()
+sendMessage frame c@(Client _ handler subscriptionId) = do
+    unique <- newUnique
+    frame' <- return $ addFrameHeaderFront (messageIdHeader $ show $ hashUnique unique) frame
+    forkIO $ put handler (transformMessage frame' c)
+    return ()
+
+transformMessage :: Frame -> Client -> Frame
+transformMessage (Frame _ headers body) (Client _ _ subscriptionId) = 
+    Frame MESSAGE (addHeaderFront (subscriptionHeader subscriptionId) headers) body
