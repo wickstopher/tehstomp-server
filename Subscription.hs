@@ -19,13 +19,13 @@ type ClientId              = Integer
 
 data Subscription          = Subscription ClientId FrameHandler SubscriptionId Dest
 
-data Topic                 = Topic (HashMap Integer Subscription)
+data Topic                 = Topic (HashMap ClientId Subscription)
 
 data Destinations          = Destinations (HashMap Dest Topic)
 
 data Update                = Add Subscription |
                              Remove Subscription |
-                            GotMessage Dest Frame
+                             GotMessage Dest Frame
 
 data SubscriptionNotifier  = SubscriptionNotifier (SChan Update)
 
@@ -59,21 +59,21 @@ handleUpdate (Remove sub@(Subscription _ _ _ dest)) d@(Destinations topicMap) =
     return $ Destinations $ insert dest (removeSub d sub) topicMap
 handleUpdate (GotMessage dest frame) d@(Destinations topicMap) = do
     case HM.lookup dest topicMap of
-        Just (Topic subMap) -> sendMessageToSubs frame subMap
+        Just (Topic clientSubs) -> sendMessageToSubs frame clientSubs
         Nothing             -> throw $ DestinationDoesNotExist dest
     return d
 
 addSub :: Destinations -> Subscription -> Topic
-addSub d@(Destinations topicMap) sub@(Subscription subId _ _ dest) =
+addSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
     case HM.lookup dest topicMap of
-            Just (Topic subMap) -> Topic (HM.insert subId sub subMap)
-            Nothing             -> Topic (singleton subId sub)
+            Just (Topic clientSubs) -> Topic (HM.insert clientId sub clientSubs)
+            Nothing                 -> Topic (singleton clientId sub)
 
 removeSub :: Destinations -> Subscription -> Topic
-removeSub d@(Destinations topicMap) sub@(Subscription subId _ _ dest) =
+removeSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
     case HM.lookup dest topicMap of
-        Just (Topic subMap) -> Topic (HM.delete subId subMap)
-        Nothing             -> throw $ ClientNotSubscribed dest
+        Just (Topic clientSubs) -> Topic (HM.delete clientId clientSubs)
+        Nothing                 -> throw $ ClientNotSubscribed dest
 
 sendMessageToSubs :: Frame -> (HashMap Integer Subscription) -> IO ()
 sendMessageToSubs frame subMap = mapM_ (sendMessage frame) subMap
