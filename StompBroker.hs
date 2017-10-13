@@ -2,6 +2,7 @@ import Control.Concurrent
 import Control.Exception
 import Data.ByteString as BS
 import Data.List as List
+import Data.Unique
 import Stomp.Frames.IO
 import Network.Socket hiding (close)
 import Prelude hiding (log)
@@ -11,81 +12,85 @@ import Stomp.Frames
 import Stomp.TLogger
 import Subscription
 
-data ClientException = NoSubscriptionHeader |
+data ClientException = NoIdHeader |
                        NoDestinationHeader  |
                        SubscriptionUpdate
 
 instance Exception ClientException
 instance Show ClientException where
-    show NoSubscriptionHeader = "No subscription header present in request"
-    show NoDestinationHeader  = "No destination header present in request"
-    show SubscriptionUpdate   = "There was an error processing the subscription request"
+    show NoIdHeader          = "No id header present in request"
+    show NoDestinationHeader = "No destination header present in request"
+    show SubscriptionUpdate  = "There was an error processing the subscription request"
 
 main :: IO ()
 main = do
-    args <- getArgs
-    port <- processArgs args
-    console <- dateTimeLogger stdout
-    sock <- socket AF_INET Stream 0
+    args     <- getArgs
+    port     <- processArgs args
+    console  <- dateTimeLogger stdout
+    notifier <- initNotifier
+    sock     <- socket AF_INET Stream 0
     setSocketOption sock ReuseAddr 1
     bind sock (SockAddrInet port iNADDR_ANY)
     listen sock 5
     log console $ "STOMP broker initiated on port " ++ (show port)
-    socketLoop sock console initSubscriptions
+    socketLoop sock console notifier
 
 processArgs :: [String] -> IO PortNumber
 processArgs (s:[]) = return $ fromIntegral ((read s)::Int)
 processArgs _      = return 2323
 
-socketLoop :: Socket -> Logger -> Subscriptions -> IO ()
-socketLoop sock console subs = do
+socketLoop :: Socket -> Logger -> Notifier -> IO ()
+socketLoop sock console notifier = do
     (uSock, _) <- accept sock
     addr <- getPeerName uSock
     log console $ "New connection received from " ++ (show addr)
     handle <- socketToHandle uSock ReadWriteMode
     hSetBuffering handle NoBuffering
     frameHandler <- initFrameHandler handle
-    forkIO $ negotiateConnection frameHandler (addTransform (stringTransform ("[" ++ show addr ++ "]")) console) subs
-    socketLoop sock console subs
+    forkIO $ negotiateConnection frameHandler (addTransform (stringTransform ("[" ++ show addr ++ "]")) console) notifier
+    socketLoop sock console notifier
 
-negotiateConnection :: FrameHandler -> Logger -> Subscriptions -> IO ()
-negotiateConnection frameHandler console subs = do
+negotiateConnection :: FrameHandler -> Logger -> Notifier -> IO ()
+negotiateConnection frameHandler console notifier = do
     frame <- get frameHandler
     case (getCommand frame) of
         STOMP   -> do
             log console "STOMP frame received; negotiating new connection"
-            handleNewConnection frameHandler frame console subs
+            handleNewConnection frameHandler frame console notifier
         CONNECT -> do
             log console "CONNECT frame received; negotiating new connection"
-            handleNewConnection frameHandler frame console subs
+            handleNewConnection frameHandler frame console notifier
         _       -> do
             log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
             rejectConnection frameHandler "Please initiate communications with a connection request"
     
-handleNewConnection :: FrameHandler -> Frame -> Logger -> Subscriptions -> IO ()
-handleNewConnection frameHandler frame console subs = let version = determineVersion frame in
+handleNewConnection :: FrameHandler -> Frame -> Logger -> Notifier -> IO ()
+handleNewConnection frameHandler frame console notifier = let version = determineVersion frame in
     case version of
         Just v  -> do 
             sendConnectedResponse frameHandler v
+            uniqueId <- newUnique
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
-            connectionLoop frameHandler console subs
+            log console $ "Client unique ID is " ++ (show $ hashUnique uniqueId)
+            connectionLoop frameHandler console notifier (hashUnique uniqueId) []
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
 
-connectionLoop :: FrameHandler -> Logger -> Subscriptions -> IO ()
-connectionLoop frameHandler console subs = do
-    result <- try (handleNextFrame frameHandler console subs) :: IO (Either SomeException Command)
+connectionLoop :: FrameHandler -> Logger -> Notifier -> ClientId -> [Subscription] -> IO ()
+connectionLoop frameHandler console notifier clientId subs = do
+    result <- try (handleNextFrame frameHandler console notifier clientId subs) 
+        :: IO (Either SomeException (Command, [Subscription]))
     case result of
         Left exception -> do
             log console $ "There was an error processing a client frame: " ++ (show exception)
             rejectConnection frameHandler $ "Error: " ++ (show exception)
-        Right command -> case command of
+        Right (command, subs)-> case command of
             DISCONNECT -> return ()
-            _          -> connectionLoop frameHandler console subs
+            _          -> connectionLoop frameHandler console notifier clientId subs
 
-handleNextFrame :: FrameHandler -> Logger -> Subscriptions -> IO Command
-handleNextFrame frameHandler console subs = do 
+handleNextFrame :: FrameHandler -> Logger -> Notifier -> ClientId -> [Subscription] -> IO (Command, [Subscription])
+handleNextFrame frameHandler console notifier clientId subs = do 
     frame <- get frameHandler
     command <- return $ getCommand frame
     log console $ "Received " ++ (show command) ++ " frame"
@@ -94,14 +99,16 @@ handleNextFrame frameHandler console subs = do
         DISCONNECT -> do 
             log console "Disconnect request received; closing connection to client"
             close frameHandler
-        SEND       -> handleSendFrame frame console
-        SUBSCRIBE  -> do 
-            updatedSubs <- handleSubscriptionRequest frameHandler frame console subs
-            case updatedSubs of
-                Just subs' -> connectionLoop frameHandler console subs'
-                Nothing    -> throw SubscriptionUpdate
-        _          -> log console "Handler not yet implemented"
-    return command
+            return (command, subs)
+        SEND       -> do 
+            handleSendFrame frame console
+            return (command, subs)
+        SUBSCRIBE  -> do
+            newSub <- handleSubscriptionRequest frameHandler frame notifier clientId
+            return (command, newSub:subs)
+        _          -> do
+            log console "Handler not yet implemented"
+            return (command, subs)
 
 handleSendFrame :: Frame -> Logger -> IO ()
 handleSendFrame frame console = case getDestination frame of
@@ -110,27 +117,23 @@ handleSendFrame frame console = case getDestination frame of
         log console $ "Message contents: " ++ (show $ getBody frame)
     Nothing -> log console "No destination specified in SEND frame"
 
-handleSubscriptionRequest :: FrameHandler -> Frame -> Logger -> Subscriptions -> IO (Maybe Subscriptions)
-handleSubscriptionRequest handler frame console subs = 
-    case getDestination frame of
-        Just destination -> let subscriber = Subscriber handler (getAckType $ getAck frame) (getSubscriptionId $ getId frame) in do
-                subs' <- updateSubs destination subs
-                return $ addSubscriber subscriber destination subs'
-        Nothing -> throw NoDestinationHeader
+handleSubscriptionRequest :: FrameHandler -> Frame -> Notifier -> ClientId -> IO Subscription
+handleSubscriptionRequest handler frame notifier clientId = 
+    let (maybeDest, maybeId) = (getDestination frame, getId frame) in
+        getNewSub maybeDest maybeId handler notifier clientId
 
-getAckType :: Maybe String -> AckType
-getAckType (Just "client")             = Client
-getAckType (Just "client-individual)") = ClientIndividual
-getAckType _                           = Auto
+getNewSub :: Maybe String -> Maybe String -> FrameHandler -> Notifier -> ClientId -> IO Subscription
+getNewSub Nothing _ _ _ _ = throw NoDestinationHeader
+getNewSub _ Nothing _ _ _ = throw NoIdHeader
+getNewSub (Just dest) (Just subId) handler notifier clientId = 
+    addSubscription notifier clientId handler subId dest
 
-getSubscriptionId :: Maybe String -> String
-getSubscriptionId (Just id) = id
-getSubscriptionId Nothing   = throw NoSubscriptionHeader
+-- getAckType :: Maybe String -> AckType
+-- getAckType (Just "client")             = Client
+-- getAckType (Just "client-individual)") = ClientIndividual
+-- getAckType _                           = Auto
 
-updateSubs :: String -> Subscriptions -> IO Subscriptions
-updateSubs destination subs = case getTopic destination subs of
-    Just topic -> return subs
-    Nothing    -> return $ addTopic destination subs
+
 
 sendConnectedResponse :: FrameHandler -> String -> IO ()
 sendConnectedResponse frameHandler version = let response = connected version in

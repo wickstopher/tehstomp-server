@@ -2,7 +2,10 @@ module Subscription (
     initNotifier,
     addSubscription,
     removeSubscription,
-    reportMessage
+    reportMessage,
+    ClientId,
+    Notifier,
+    Subscription
 ) where
 
 import Control.Concurrent
@@ -15,7 +18,7 @@ import Stomp.Frames.IO
 
 type Dest                  = String
 type SubscriptionId        = String
-type ClientId              = Integer
+type ClientId              = Int
 
 data Subscription          = Subscription ClientId FrameHandler SubscriptionId Dest
 
@@ -27,7 +30,7 @@ data Update                = Add Subscription |
                              Remove Subscription |
                              GotMessage Dest Frame
 
-data SubscriptionNotifier  = SubscriptionNotifier (SChan Update)
+data Notifier              = Notifier (SChan Update)
 
 data SubscriptionException = ClientNotSubscribed Dest |
                              DestinationDoesNotExist Dest |
@@ -39,12 +42,12 @@ instance Show SubscriptionException where
     show (DestinationDoesNotExist dest) = "Destination " ++ dest ++ " does not exist"
     show NoDestinationHeader            = "Received a frame without a destination header"
 
-initNotifier :: IO SubscriptionNotifier
+initNotifier :: IO Notifier
 initNotifier = do
     updateChan   <- sync newSChan
     destinations <- return $ Destinations empty
     forkIO $ notificationLoop updateChan destinations
-    return $ SubscriptionNotifier updateChan
+    return $ Notifier updateChan
 
 notificationLoop :: SChan Update -> Destinations -> IO ()
 notificationLoop updateChan destinations = do
@@ -75,7 +78,7 @@ removeSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
         Just (Topic clientSubs) -> Topic (HM.delete clientId clientSubs)
         Nothing                 -> throw $ ClientNotSubscribed dest
 
-sendMessageToSubs :: Frame -> (HashMap Integer Subscription) -> IO ()
+sendMessageToSubs :: Frame -> (HashMap ClientId Subscription) -> IO ()
 sendMessageToSubs frame subMap = mapM_ (sendMessage frame) subMap
 
 sendMessage :: Frame -> Subscription -> IO ()
@@ -89,17 +92,17 @@ transformMessage :: Frame -> Subscription -> Frame
 transformMessage (Frame _ headers body) (Subscription _ _ subId _) = 
     Frame MESSAGE (addHeaderFront (subscriptionHeader subId) headers) body
 
-addSubscription :: SubscriptionNotifier -> ClientId -> FrameHandler -> SubscriptionId -> Dest -> IO Subscription
-addSubscription (SubscriptionNotifier chan) clientId handler subId dest = 
+addSubscription :: Notifier -> ClientId -> FrameHandler -> SubscriptionId -> Dest -> IO Subscription
+addSubscription (Notifier chan) clientId handler subId dest = 
     let subscription = (Subscription clientId handler subId dest) in do
         sync $ sendEvt chan (Add subscription)
         return subscription
 
-removeSubscription :: SubscriptionNotifier -> Subscription -> IO ()
-removeSubscription (SubscriptionNotifier chan) client = sync $ sendEvt chan (Remove client)
+removeSubscription :: Notifier -> Subscription -> IO ()
+removeSubscription (Notifier chan) client = sync $ sendEvt chan (Remove client)
 
-reportMessage :: SubscriptionNotifier -> Frame -> IO ()
-reportMessage (SubscriptionNotifier chan) frame = 
+reportMessage :: Notifier -> Frame -> IO ()
+reportMessage (Notifier chan) frame = 
     case (getDestination frame) of
         Just dest -> sync $ sendEvt chan (GotMessage dest frame)
         Nothing   -> throw NoDestinationHeader
