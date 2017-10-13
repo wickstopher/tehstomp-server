@@ -101,7 +101,7 @@ handleNextFrame frameHandler console notifier clientId subs = do
             close frameHandler
             return (command, subs)
         SEND       -> do 
-            handleSendFrame frame console
+            handleSendFrame frame console notifier
             return (command, subs)
         SUBSCRIBE  -> do
             newSub <- handleSubscriptionRequest frameHandler frame notifier clientId
@@ -110,12 +110,8 @@ handleNextFrame frameHandler console notifier clientId subs = do
             log console "Handler not yet implemented"
             return (command, subs)
 
-handleSendFrame :: Frame -> Logger -> IO ()
-handleSendFrame frame console = case getDestination frame of
-    Just destination -> do
-        log console $ "Message destination: " ++ destination
-        log console $ "Message contents: " ++ (show $ getBody frame)
-    Nothing -> log console "No destination specified in SEND frame"
+handleSendFrame :: Frame -> Logger -> Notifier -> IO ()
+handleSendFrame frame console notifier = reportMessage notifier frame
 
 handleSubscriptionRequest :: FrameHandler -> Frame -> Notifier -> ClientId -> IO Subscription
 handleSubscriptionRequest handler frame notifier clientId = 
