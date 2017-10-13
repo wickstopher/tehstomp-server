@@ -22,7 +22,7 @@ type ClientId              = Int
 
 data Subscription          = Subscription ClientId FrameHandler SubscriptionId Dest
 
-data Topic                 = Topic (HashMap ClientId Subscription)
+data Topic                 = Topic (HashMap ClientId [Subscription])
 
 data Destinations          = Destinations (HashMap Dest Topic)
 
@@ -63,14 +63,16 @@ handleUpdate (Remove sub@(Subscription _ _ _ dest)) d@(Destinations topicMap) =
 handleUpdate (GotMessage dest frame) d@(Destinations topicMap) = do
     case HM.lookup dest topicMap of
         Just (Topic clientSubs) -> sendMessageToSubs frame clientSubs
-        Nothing             -> throw $ DestinationDoesNotExist dest
+        Nothing                 -> throw $ DestinationDoesNotExist dest
     return d
 
 addSub :: Destinations -> Subscription -> Topic
 addSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
     case HM.lookup dest topicMap of
-            Just (Topic clientSubs) -> Topic (HM.insert clientId sub clientSubs)
-            Nothing                 -> Topic (singleton clientId sub)
+            Just (Topic clientSubs) -> case HM.lookup clientId clientSubs of
+                Just subList -> Topic (HM.insert clientId (sub:subList) clientSubs)
+                Nothing      -> Topic (HM.insert clientId [sub] clientSubs)
+            Nothing                 -> Topic (singleton clientId [sub])
 
 removeSub :: Destinations -> Subscription -> Topic
 removeSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
@@ -78,15 +80,16 @@ removeSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
         Just (Topic clientSubs) -> Topic (HM.delete clientId clientSubs)
         Nothing                 -> throw $ ClientNotSubscribed dest
 
-sendMessageToSubs :: Frame -> (HashMap ClientId Subscription) -> IO ()
+sendMessageToSubs :: Frame -> (HashMap ClientId [Subscription]) -> IO ()
 sendMessageToSubs frame subMap = mapM_ (sendMessage frame) subMap
 
-sendMessage :: Frame -> Subscription -> IO ()
-sendMessage frame sub@(Subscription _ handler subId _) = do
+sendMessage :: Frame -> [Subscription] -> IO ()
+sendMessage _ [] = return ()
+sendMessage frame (sub@(Subscription _ handler subId _):rest) = do
     unique <- newUnique
     frame' <- return $ addFrameHeaderFront (messageIdHeader $ show $ hashUnique unique) frame
     forkIO $ put handler (transformMessage frame' sub)
-    return ()
+    sendMessage frame rest
 
 transformMessage :: Frame -> Subscription -> Frame
 transformMessage (Frame _ headers body) (Subscription _ _ subId _) = 
