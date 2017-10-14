@@ -28,13 +28,32 @@ data Destinations          = Destinations (HashMap Dest Topic)
 
 data Update                = Add Subscription |
                              Remove Subscription |
-                             GotMessage Dest Frame
+                             GotMessage Dest Frame |
+                             Success |
+                             Error SubscriptionException
 
 data Notifier              = Notifier (SChan Update)
 
 data SubscriptionException = ClientNotSubscribed Dest |
                              DestinationDoesNotExist Dest |
                              NoDestinationHeader
+
+instance Show Subscription where
+    show (Subscription clientId _ subId dest) = 
+        "[" ++ (show clientId) ++ (", ") ++ (show subId) ++ ", " ++ dest ++ "]"
+
+instance Show Topic where 
+    show (Topic tMap) = "{Topic " ++ (show tMap) ++ "}"
+
+instance Show Destinations where
+    show (Destinations dMap) = "{Destinations " ++ show dMap ++ "}"
+
+instance Show Update where
+    show (Add sub)        = "(Add, " ++ (show sub) ++ ")"
+    show (Remove sub)     = "(Remove, " ++ (show sub) ++ ")"
+    show (GotMessage d f) = "(GotMessage, " ++ ", " ++ d ++ (show f) ++ ")"
+    show Success          = "Success"
+    show (Error e)        = "Error: " ++ (show e)
 
 instance Exception SubscriptionException
 instance Show SubscriptionException where
@@ -51,20 +70,34 @@ initNotifier = do
 
 notificationLoop :: SChan Update -> Destinations -> IO ()
 notificationLoop updateChan destinations = do
-    update <- sync $ recvEvt updateChan
-    destinations' <- handleUpdate update destinations
+    (destinations', update) <- sync $ ((recvEvt updateChan) `thenEvt` (handleUpdate destinations updateChan))
+    handleNotifications update destinations'
     notificationLoop updateChan destinations'
 
-handleUpdate :: Update -> Destinations -> IO Destinations
-handleUpdate (Add sub@(Subscription _ _ _ dest)) d@(Destinations topicMap) = 
-    return $ Destinations $ insert dest (addSub d sub) topicMap
-handleUpdate (Remove sub@(Subscription _ _ _ dest)) d@(Destinations topicMap) = 
-    return $ Destinations $ insert dest (removeSub d sub) topicMap
-handleUpdate (GotMessage dest frame) d@(Destinations topicMap) = do
+handleNotifications :: Update -> Destinations -> IO ()
+handleNotifications (GotMessage dest frame) (Destinations topicMap) = 
     case HM.lookup dest topicMap of
         Just (Topic clientSubs) -> sendMessageToSubs frame clientSubs
-        Nothing                 -> throw $ DestinationDoesNotExist dest
-    return d
+        Nothing                 -> return ()
+handleNotifications _ _ = return ()
+
+handleUpdate :: Destinations -> SChan Update -> Update -> Evt (Destinations, Update)
+handleUpdate d@(Destinations topicMap) updateChan u@(Add sub@(Subscription _ _ _ dest)) = 
+    (sendEvt updateChan Success) `thenEvt` (\_ -> alwaysEvt $ ((Destinations $ insert dest (addSub d sub) topicMap, u)))
+
+handleUpdate d@(Destinations topicMap) updateChan u@(Remove sub@(Subscription _ _ _ dest)) = 
+    case removeSub d sub of
+        Just topic ->
+            (sendEvt updateChan Success) `thenEvt` (\_ -> alwaysEvt $ ((Destinations $ insert dest topic topicMap), u))
+        Nothing    ->
+            (sendEvt updateChan Success) `thenEvt` (\_ -> alwaysEvt (d, u))
+
+handleUpdate d@(Destinations topicMap) updateChan u@(GotMessage dest frame) = do
+    case HM.lookup dest topicMap of
+        Just (Topic clientSubs) ->
+            (sendEvt updateChan Success) `thenEvt` (\_ -> alwaysEvt (d, u))
+        Nothing                 ->
+            (sendEvt updateChan (Error $ DestinationDoesNotExist dest)) `thenEvt` (\_ -> alwaysEvt (d, u))
 
 addSub :: Destinations -> Subscription -> Topic
 addSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
@@ -74,11 +107,11 @@ addSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
                 Nothing      -> Topic (HM.insert clientId [sub] clientSubs)
             Nothing                 -> Topic (singleton clientId [sub])
 
-removeSub :: Destinations -> Subscription -> Topic
+removeSub :: Destinations -> Subscription -> (Maybe Topic)
 removeSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
     case HM.lookup dest topicMap of
-        Just (Topic clientSubs) -> Topic (HM.delete clientId clientSubs)
-        Nothing                 -> throw $ ClientNotSubscribed dest
+        Just (Topic clientSubs) -> Just $ Topic (HM.delete clientId clientSubs)
+        Nothing                 -> Nothing
 
 sendMessageToSubs :: Frame -> (HashMap ClientId [Subscription]) -> IO ()
 sendMessageToSubs frame subMap = mapM_ (sendMessage frame) subMap
@@ -96,16 +129,25 @@ transformMessage (Frame _ headers body) (Subscription _ _ subId _) =
     Frame MESSAGE (addHeaderFront (subscriptionHeader subId) headers) body
 
 addSubscription :: Notifier -> ClientId -> FrameHandler -> SubscriptionId -> Dest -> IO Subscription
-addSubscription (Notifier chan) clientId handler subId dest = 
+addSubscription notifier clientId handler subId dest = 
     let subscription = (Subscription clientId handler subId dest) in do
-        sync $ sendEvt chan (Add subscription)
+        handleEventNotification (Add subscription) notifier
         return subscription
 
 removeSubscription :: Notifier -> Subscription -> IO ()
-removeSubscription (Notifier chan) client = sync $ sendEvt chan (Remove client)
+removeSubscription notifier client = do
+    handleEventNotification (Remove client) notifier
 
 reportMessage :: Notifier -> Frame -> IO ()
-reportMessage (Notifier chan) frame = 
+reportMessage notifier frame = 
     case (getDestination frame) of
-        Just dest -> sync $ sendEvt chan (GotMessage dest frame)
+        Just dest -> handleEventNotification (GotMessage dest frame) notifier
         Nothing   -> throw NoDestinationHeader
+
+handleEventNotification :: Update -> Notifier -> IO ()
+handleEventNotification event (Notifier chan) = do
+    result <- sync $ (sendEvt chan event) `thenEvt` (\_ -> recvEvt chan)
+    case result of 
+        Success -> return ()
+        Error e -> throw e
+        _       -> error $ "Got an unexpected result: " ++ (show result)
