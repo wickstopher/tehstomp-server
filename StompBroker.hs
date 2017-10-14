@@ -62,7 +62,7 @@ negotiateConnection frameHandler console notifier = do
             handleNewConnection frameHandler frame console notifier
         _       -> do
             log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
-            rejectConnection frameHandler "Please initiate communications with a connection request"
+            rejectConnection console frameHandler "Please initiate communications with a connection request"
     
 handleNewConnection :: FrameHandler -> Frame -> Logger -> Notifier -> IO ()
 handleNewConnection frameHandler frame console notifier = let version = determineVersion frame in
@@ -75,7 +75,7 @@ handleNewConnection frameHandler frame console notifier = let version = determin
             connectionLoop frameHandler console notifier (hashUnique uniqueId) []
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
-            rejectConnection frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
+            rejectConnection console frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
 
 connectionLoop :: FrameHandler -> Logger -> Notifier -> ClientId -> [Subscription] -> IO ()
 connectionLoop frameHandler console notifier clientId subs = do
@@ -84,7 +84,7 @@ connectionLoop frameHandler console notifier clientId subs = do
     case result of
         Left exception -> do
             log console $ "There was an error processing a client frame: " ++ (show exception)
-            rejectConnection frameHandler $ "Error: " ++ (show exception)
+            rejectConnection console frameHandler ("Error: " ++ (show exception))
         Right (command, subs)-> case command of
             DISCONNECT -> return ()
             _          -> connectionLoop frameHandler console notifier clientId subs
@@ -135,10 +135,11 @@ sendConnectedResponse :: FrameHandler -> String -> IO ()
 sendConnectedResponse frameHandler version = let response = connected version in
     do put frameHandler response
 
-rejectConnection :: FrameHandler -> String -> IO ()
-rejectConnection frameHandler message = let response = errorFrame message in
-    do  put frameHandler response
-        close frameHandler
+rejectConnection :: Logger -> FrameHandler -> String -> IO ()
+rejectConnection console frameHandler message = let response = errorFrame message in do  
+    log console "Rejecting connection!"
+    put frameHandler response
+    close frameHandler
 
 determineVersion :: Frame -> Maybe String
 determineVersion frame = 
