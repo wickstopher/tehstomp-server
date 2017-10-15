@@ -66,6 +66,8 @@ negotiateConnection frameHandler console notifier = do
                 rejectConnection console frameHandler "Please initiate communications with a connection request"
         GotEof -> do
             log console "Client disconnected before connection could be negotiated."
+        ParseError msg -> do
+            log console $ "There was an error parsing the frame from the client: " ++ msg
     
 handleNewConnection :: FrameHandler -> Frame -> Logger -> Notifier -> IO ()
 handleNewConnection frameHandler frame console notifier = let version = determineVersion frame in
@@ -92,7 +94,6 @@ connectionLoop frameHandler console notifier clientId subs = do
             Just DISCONNECT -> return ()
             Just _          -> connectionLoop frameHandler console notifier clientId subs
             Nothing         -> do
-                log console "Client disconnected without sending a frame."
                 close frameHandler
                 return ()
 
@@ -118,7 +119,12 @@ handleNextFrame frameHandler console notifier clientId subs = do
                 _          -> do
                     log console "Handler not yet implemented"
                     return (Just command, subs)
-        GotEof -> return (Nothing, subs)
+        GotEof         -> do
+            log console "Client disconnected without sending a frame."
+            return (Nothing, subs)
+        ParseError msg -> do
+            log console $ "There was an error parsing a client frame: " ++ (show msg)
+            return (Nothing, subs)
 
 handleSendFrame :: Frame -> Logger -> Notifier -> IO ()
 handleSendFrame frame console notifier = reportMessage notifier frame
