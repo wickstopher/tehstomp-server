@@ -52,17 +52,20 @@ socketLoop sock console notifier = do
 
 negotiateConnection :: FrameHandler -> Logger -> Notifier -> IO ()
 negotiateConnection frameHandler console notifier = do
-    frame <- get frameHandler
-    case (getCommand frame) of
-        STOMP   -> do
-            log console "STOMP frame received; negotiating new connection"
-            handleNewConnection frameHandler frame console notifier
-        CONNECT -> do
-            log console "CONNECT frame received; negotiating new connection"
-            handleNewConnection frameHandler frame console notifier
-        _       -> do
-            log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
-            rejectConnection console frameHandler "Please initiate communications with a connection request"
+    f <- get frameHandler
+    case f of 
+        NewFrame frame -> case (getCommand frame) of
+            STOMP   -> do
+                log console "STOMP frame received; negotiating new connection"
+                handleNewConnection frameHandler frame console notifier
+            CONNECT -> do
+                log console "CONNECT frame received; negotiating new connection"
+                handleNewConnection frameHandler frame console notifier
+            _       -> do
+                log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
+                rejectConnection console frameHandler "Please initiate communications with a connection request"
+        GotEof -> do
+            log console "Client disconnected before connection could be negotiated."
     
 handleNewConnection :: FrameHandler -> Frame -> Logger -> Notifier -> IO ()
 handleNewConnection frameHandler frame console notifier = let version = determineVersion frame in
@@ -80,35 +83,41 @@ handleNewConnection frameHandler frame console notifier = let version = determin
 connectionLoop :: FrameHandler -> Logger -> Notifier -> ClientId -> [Subscription] -> IO ()
 connectionLoop frameHandler console notifier clientId subs = do
     result <- try (handleNextFrame frameHandler console notifier clientId subs) 
-        :: IO (Either SomeException (Command, [Subscription]))
+        :: IO (Either SomeException (Maybe Command, [Subscription]))
     case result of
         Left exception -> do
             log console $ "There was an error processing a client frame: " ++ (show exception)
             rejectConnection console frameHandler ("Error: " ++ (show exception))
         Right (command, subs)-> case command of
-            DISCONNECT -> return ()
-            _          -> connectionLoop frameHandler console notifier clientId subs
+            Just DISCONNECT -> return ()
+            Just _          -> connectionLoop frameHandler console notifier clientId subs
+            Nothing         -> do
+                log console "Client disconnected without sending a frame."
+                return ()
 
-handleNextFrame :: FrameHandler -> Logger -> Notifier -> ClientId -> [Subscription] -> IO (Command, [Subscription])
+handleNextFrame :: FrameHandler -> Logger -> Notifier -> ClientId -> [Subscription] -> IO (Maybe Command, [Subscription])
 handleNextFrame frameHandler console notifier clientId subs = do 
-    frame <- get frameHandler
-    command <- return $ getCommand frame
-    log console $ "Received " ++ (show command) ++ " frame"
-    handleReceiptRequest frameHandler frame console
-    case command of
-        DISCONNECT -> do 
-            log console "Disconnect request received; closing connection to client"
-            close frameHandler
-            return (command, subs)
-        SEND       -> do 
-            handleSendFrame frame console notifier
-            return (command, subs)
-        SUBSCRIBE  -> do
-            newSub <- handleSubscriptionRequest frameHandler frame notifier clientId
-            return (command, newSub:subs)
-        _          -> do
-            log console "Handler not yet implemented"
-            return (command, subs)
+    f <- get frameHandler
+    case f of 
+        NewFrame frame -> do
+            command <- return $ getCommand frame
+            log console $ "Received " ++ (show command) ++ " frame"
+            handleReceiptRequest frameHandler frame console
+            case command of
+                DISCONNECT -> do 
+                    log console "Disconnect request received; closing connection to client"
+                    close frameHandler
+                    return (Just command, subs)
+                SEND       -> do 
+                    handleSendFrame frame console notifier
+                    return (Just command, subs)
+                SUBSCRIBE  -> do
+                    newSub <- handleSubscriptionRequest frameHandler frame notifier clientId
+                    return (Just command, newSub:subs)
+                _          -> do
+                    log console "Handler not yet implemented"
+                    return (Just command, subs)
+        GotEof -> return (Nothing, subs)
 
 handleSendFrame :: Frame -> Logger -> Notifier -> IO ()
 handleSendFrame frame console notifier = reportMessage notifier frame
