@@ -114,14 +114,15 @@ removeSub d@(Destinations topicMap) sub@(Subscription clientId _ _ dest) =
         Nothing                 -> Nothing
 
 sendMessageToSubs :: Frame -> (HashMap ClientId [Subscription]) -> IO ()
-sendMessageToSubs frame subMap = mapM_ (sendMessage frame) subMap
+sendMessageToSubs frame subMap = do
+    unique <- newUnique
+    frame  <- return $ addFrameHeaderFront (messageIdHeader $ show $ hashUnique unique) frame
+    mapM_ (sendMessage frame) subMap
 
 sendMessage :: Frame -> [Subscription] -> IO ()
 sendMessage _ [] = return ()
 sendMessage frame (sub@(Subscription _ handler subId _):rest) = do
-    unique <- newUnique
-    frame' <- return $ addFrameHeaderFront (messageIdHeader $ show $ hashUnique unique) frame
-    forkIO $ put handler (transformMessage frame' sub)
+    forkIO $ put handler (transformMessage frame sub)
     sendMessage frame rest
 
 transformMessage :: Frame -> Subscription -> Frame
