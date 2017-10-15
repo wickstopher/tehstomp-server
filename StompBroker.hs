@@ -93,6 +93,7 @@ connectionLoop frameHandler console notifier clientId subs = do
             Just _          -> connectionLoop frameHandler console notifier clientId subs
             Nothing         -> do
                 log console "Client disconnected without sending a frame."
+                close frameHandler
                 return ()
 
 handleNextFrame :: FrameHandler -> Logger -> Notifier -> ClientId -> [Subscription] -> IO (Maybe Command, [Subscription])
