@@ -1,12 +1,18 @@
 -- |The Subscriptions module deals with managing subscriptions on the STOMP broker.
 module Subscriptions (
-
+    ClientId,
+    Response(..),
+    SubscriptionManager,
+    initManager,
+    unsubscribe,
+    subscribe,
+    sendMessage
 ) where
 
 import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
-import Stomp.Frames
+import Stomp.Frames hiding (subscribe)
 import Stomp.Frames.IO
 
 type ClientId            = Int
@@ -80,11 +86,11 @@ handleUpdate (Update (Remove clientId subId) rChan) subs = do
     return $ removeSubscription clientId subId subs
 -- GotMessage
 handleUpdate (Update (GotMessage dest frame) rChan) subs = do
-    forkIO $ sync $ sendEvt rChan Success
+    forkIO $ handleMessage frame dest subs rChan
     return subs
 
 addSubscription :: Destination -> ClientSub -> Subscriptions -> Subscriptions
-addSubscription dest clientSub@(ClientSub clientId subId handler) (Subscriptions subMap subIds) =
+addSubscription dest clientSub@(ClientSub clientId subId _) (Subscriptions subMap subIds) =
     let clientSubs' = case HM.lookup dest subMap of
             Just clientSubs -> HM.insert clientId clientSub clientSubs
             Nothing         -> HM.singleton clientId clientSub
@@ -99,3 +105,23 @@ removeSubscription clientId subId subs@(Subscriptions subMap subIds) =
                 Just clients -> Subscriptions (HM.insert destination (HM.delete clientId clients) subMap) subIds'
                 Nothing      -> Subscriptions subMap subIds'
         Nothing          -> subs
+
+handleMessage :: Frame -> Destination -> Subscriptions -> SChan Response -> IO ()
+handleMessage frame dest (Subscriptions subMap _) responseChan =
+    case HM.lookup dest subMap of
+        Just clientSubs -> do
+            sync $ constructEvt frame clientSubs
+            sync $ sendEvt responseChan Success
+        Nothing -> sync $ sendEvt responseChan (Error "No subscribers") 
+
+constructEvt :: Frame -> HashMap ClientId ClientSub -> Evt ()
+constructEvt frame = HM.foldr (partialEvt frame) neverEvt
+
+partialEvt :: Frame -> ClientSub -> Evt () -> Evt ()
+partialEvt frame sub@(ClientSub _ _ frameHandler) = 
+    let frame' = transformFrame frame sub in
+        chooseEvt (putEvt frame' frameHandler)
+
+transformFrame :: Frame -> ClientSub -> Frame
+transformFrame (Frame _ headers body) (ClientSub _ subId _) = 
+    Frame MESSAGE (addHeaderFront (subscriptionHeader subId) headers) body

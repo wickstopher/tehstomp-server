@@ -8,9 +8,9 @@ import Network.Socket hiding (close)
 import Prelude hiding (log)
 import System.IO as IO
 import System.Environment
-import Stomp.Frames
+import Stomp.Frames hiding (subscribe)
 import Stomp.TLogger
-import Subscription
+import Subscriptions
 
 data ClientException = NoIdHeader |
                        NoDestinationHeader  |
@@ -84,7 +84,7 @@ handleNewConnection frameHandler frame console subManager = let version = determ
             uniqueId <- newUnique
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
             log console $ "Client unique ID is " ++ (show $ hashUnique uniqueId)
-            connectionLoop frameHandler console subManager (hashUnique uniqueId) []
+            connectionLoop frameHandler console subManager (hashUnique uniqueId)
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection console frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
@@ -117,24 +117,24 @@ getHighestSupportedVersion clientVersions =
         maybeMax mutualVersions
 
 -- |Loop, receiving and processing new Frames from the client.
-connectionLoop :: FrameHandler -> Logger -> SubscriptionManager -> ClientId -> [Subscription] -> IO ()
-connectionLoop frameHandler console subManager clientId subs = do
-    result <- try (handleNextFrame frameHandler console subManager clientId subs) 
-        :: IO (Either SomeException (Maybe Command, [Subscription]))
+connectionLoop :: FrameHandler -> Logger -> SubscriptionManager -> ClientId -> IO ()
+connectionLoop frameHandler console subManager clientId = do
+    result <- try (handleNextFrame frameHandler console subManager clientId) 
+        :: IO (Either SomeException (Maybe Command))
     case result of
         Left exception -> do
             log console $ "There was an error processing a client frame: " ++ (show exception)
             rejectConnection console frameHandler ("Error: " ++ (show exception))
-        Right (command, subs)-> case command of
+        Right command -> case command of
             Just DISCONNECT -> return ()
-            Just _          -> connectionLoop frameHandler console subManager clientId subs
+            Just _          -> connectionLoop frameHandler console subManager clientId
             Nothing         -> do
                 close frameHandler
                 return ()
 
 -- |This function blocks until a Frame is received from the client, and then processes that Frame appropriately.
-handleNextFrame :: FrameHandler -> Logger -> SubscriptionManager -> ClientId -> [Subscription] -> IO (Maybe Command, [Subscription])
-handleNextFrame frameHandler console subManager clientId subs = do 
+handleNextFrame :: FrameHandler -> Logger -> SubscriptionManager -> ClientId -> IO (Maybe Command)
+handleNextFrame frameHandler console subManager clientId = do 
     f <- get frameHandler
     case f of 
         NewFrame frame -> do
@@ -145,39 +145,48 @@ handleNextFrame frameHandler console subManager clientId subs = do
                 DISCONNECT -> do 
                     log console "Disconnect request received; closing connection to client"
                     close frameHandler
-                    return (Just command, subs)
+                    return $ Just command
                 SEND       -> do 
                     handleSendFrame frame console subManager
-                    return (Just command, subs)
+                    return $ Just command
                 SUBSCRIBE  -> do
                     newSub <- handleSubscriptionRequest frameHandler frame subManager clientId
-                    return (Just command, newSub:subs)
+                    return $ Just command
                 _          -> do
                     log console "Handler not yet implemented"
-                    return (Just command, subs)
+                    return $ Just command
         GotEof         -> do
             log console "Client disconnected without sending a frame."
-            return (Nothing, subs)
+            return Nothing
         ParseError msg -> do
             log console $ "There was an error parsing a client frame: " ++ (show msg)
-            return (Nothing, subs)
+            return Nothing
 
 -- |Notify the SubscriptionManager that a new SEND Frame was received
 handleSendFrame :: Frame -> Logger -> SubscriptionManager -> IO ()
-handleSendFrame frame console subManager = reportMessage subManager frame
+handleSendFrame frame console subManager = case getDestination frame of
+    Just dest -> do
+        response <- sendMessage subManager dest frame
+        case response of
+            Success -> return ()
+            Error s -> log console $ "There was an error sending the message: " ++ s
+    Nothing   -> throw NoDestinationHeader
 
 -- |Notify the SubscriptionManager that a new SUBSCRIBE Frame was received
-handleSubscriptionRequest :: FrameHandler -> Frame -> SubscriptionManager -> ClientId -> IO Subscription
+handleSubscriptionRequest :: FrameHandler -> Frame -> SubscriptionManager -> ClientId -> IO ()
 handleSubscriptionRequest handler frame subManager clientId = 
     let (maybeDest, maybeId) = (getDestination frame, getId frame) in
         getNewSub maybeDest maybeId handler subManager clientId
 
 -- |Helper function for handleSubscriptionRequest
-getNewSub :: Maybe String -> Maybe String -> FrameHandler -> SubscriptionManager -> ClientId -> IO Subscription
+getNewSub :: Maybe String -> Maybe String -> FrameHandler -> SubscriptionManager -> ClientId -> IO ()
 getNewSub Nothing _ _ _ _ = throw NoDestinationHeader
 getNewSub _ Nothing _ _ _ = throw NoIdHeader
-getNewSub (Just dest) (Just subId) handler subManager clientId = 
-    addSubscription subManager clientId handler subId dest
+getNewSub (Just dest) (Just subId) handler subManager clientId = do
+    response <- subscribe subManager dest clientId subId handler
+    case response of 
+        Success -> return ()
+        Error s -> error s
 
 -- Given a Frame, if the Frame contains a receipt Header, send a RECEIPT Frame to the client
 handleReceiptRequest :: FrameHandler -> Frame -> Logger -> IO ()
