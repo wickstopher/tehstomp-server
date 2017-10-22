@@ -62,9 +62,40 @@ sendMessage (SubscriptionManager updateChan) destination frame = do
     sync $ sendEvt updateChan $ Update (GotMessage destination frame) responseChan
     sync $ recvEvt responseChan
 
+
 updateLoop :: SChan Update -> Subscriptions -> IO ()
 updateLoop updateChan subs = do
-    (Update updateType responseChan)  <- sync $ recvEvt updateChan
-    forkIO $ sync $ sendEvt responseChan Success
-    updateLoop updateChan subs
+    update  <- sync $ recvEvt updateChan
+    subs' <- handleUpdate update subs
+    updateLoop updateChan subs'
 
+handleUpdate :: Update -> Subscriptions -> IO Subscriptions
+-- Add
+handleUpdate (Update (Add dest clientSub) rChan) subscriptions = do
+    forkIO $ sync $ sendEvt rChan Success
+    return $ addSubscription dest clientSub subscriptions
+-- Remove
+handleUpdate (Update (Remove clientId subId) rChan) subs = do
+    forkIO $ sync $ sendEvt rChan Success
+    return $ removeSubscription clientId subId subs
+-- GotMessage
+handleUpdate (Update (GotMessage dest frame) rChan) subs = do
+    forkIO $ sync $ sendEvt rChan Success
+    return subs
+
+addSubscription :: Destination -> ClientSub -> Subscriptions -> Subscriptions
+addSubscription dest clientSub@(ClientSub clientId subId handler) (Subscriptions subMap subIds) =
+    let clientSubs' = case HM.lookup dest subMap of
+            Just clientSubs -> HM.insert clientId clientSub clientSubs
+            Nothing         -> HM.singleton clientId clientSub
+    in
+        Subscriptions (insert dest clientSubs' subMap) (insert (clientId, subId) dest subIds)
+
+removeSubscription :: ClientId -> SubscriptionId -> Subscriptions -> Subscriptions
+removeSubscription clientId subId subs@(Subscriptions subMap subIds) =
+    case HM.lookup (clientId, subId) subIds of
+        Just destination -> let subIds' = HM.delete (clientId, subId) subIds in
+            case HM.lookup destination subMap of
+                Just clients -> Subscriptions (HM.insert destination (HM.delete clientId clients) subMap) subIds'
+                Nothing      -> Subscriptions subMap subIds'
+        Nothing          -> subs
