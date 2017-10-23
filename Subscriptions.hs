@@ -12,6 +12,7 @@ module Subscriptions (
 import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
+import Data.Unique (hashUnique, newUnique)
 import Stomp.Frames hiding (subscribe)
 import Stomp.Frames.IO
 
@@ -110,7 +111,9 @@ handleMessage :: Frame -> Destination -> Subscriptions -> SChan Response -> IO (
 handleMessage frame dest (Subscriptions subMap _) responseChan =
     case HM.lookup dest subMap of
         Just clientSubs -> do
-            sync $ constructEvt frame clientSubs
+            unique <- newUnique
+            frame'  <- return $ addFrameHeaderFront (messageIdHeader $ show $ hashUnique unique) frame
+            forkIO $ sync $ constructEvt frame' clientSubs
             sync $ sendEvt responseChan Success
         Nothing -> sync $ sendEvt responseChan (Error "No subscribers") 
 
