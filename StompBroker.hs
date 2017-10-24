@@ -175,18 +175,24 @@ handleSendFrame frame console subManager = case getDestination frame of
 -- |Notify the SubscriptionManager that a new SUBSCRIBE Frame was received
 handleSubscriptionRequest :: FrameHandler -> Frame -> SubscriptionManager -> ClientId -> IO ()
 handleSubscriptionRequest handler frame subManager clientId = 
-    let (maybeDest, maybeId) = (getDestination frame, getId frame) in
-        getNewSub maybeDest maybeId handler subManager clientId
+    let maybeDest = getDestination frame
+        maybeId   = getId frame
+        ackType   = selectAckType (getAckType frame)
+    in getNewSub maybeDest maybeId ackType handler subManager clientId
 
 -- |Helper function for handleSubscriptionRequest
-getNewSub :: Maybe String -> Maybe String -> FrameHandler -> SubscriptionManager -> ClientId -> IO ()
-getNewSub Nothing _ _ _ _ = throw NoDestinationHeader
-getNewSub _ Nothing _ _ _ = throw NoIdHeader
-getNewSub (Just dest) (Just subId) handler subManager clientId = do
-    response <- subscribe subManager dest clientId subId handler
+getNewSub :: Maybe String -> Maybe String -> AckType -> FrameHandler -> SubscriptionManager -> ClientId -> IO ()
+getNewSub Nothing _ _ _ _ _ = throw NoDestinationHeader
+getNewSub _ Nothing _ _ _ _ = throw NoIdHeader
+getNewSub (Just dest) (Just subId) ackType handler subManager clientId = do
+    response <- subscribe subManager dest clientId subId ackType handler
     case response of 
         Success -> return ()
         Error s -> error s
+
+selectAckType :: Maybe AckType -> AckType
+selectAckType (Just ackType) = ackType
+selectAckType Nothing        = Auto
 
 -- Given a Frame, if the Frame contains a receipt Header, send a RECEIPT Frame to the client
 handleReceiptRequest :: FrameHandler -> Frame -> Logger -> IO ()
