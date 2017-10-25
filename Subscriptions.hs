@@ -20,7 +20,7 @@ type ClientId            = Int
 type MessageId           = String
 type SubscriptionId      = String
 type Destination         = String
-
+type AckData             = Either ClientAckResponse AckContext
 -- |A HashMap to keep track of subscriptions to a given Destination.
 type SubMap              = HashMap Destination (HashMap ClientId ClientSub)
 
@@ -32,7 +32,7 @@ type SubIds              = HashMap (ClientId, SubscriptionId) Destination
 
 -- |The AckMap stores either an AckContext or a Frame (should be a NACK or ACK Frame). This is to
 -- avoid a race condition in whihc an ACK/NACK Frame could be received prior to the NeedsAck Update.
-type AckMap              = HashMap MessageId (Either Frame AckContext)
+type AckMap              = HashMap MessageId AckData
 
 -- |ClientAcks stores information about pending ACK situations for individual clients.
 type ClientAcks          = HashMap ClientId AckMap
@@ -45,12 +45,14 @@ data ClientSub           = ClientSub ClientId SubscriptionId AckType FrameHandle
 -- |An AckContext contains all the context surrounding a pending ACK request, including the original
 -- Frame in the case that it needs to be resent. The list of ClientIds represents those clients who
 -- have already NACK'd the message.
-data AckContext          = AckContext Frame ClientSub [ClientId]
+data AckContext          = AckContext Frame MessageId ClientSub [ClientId]
+
+data ClientAckResponse   = ClientAckResponse ClientId Frame
 
 data UpdateType          = Add Destination ClientSub |
                            Remove ClientId SubscriptionId |
                            GotMessage Destination Frame |
-                           AckUpdate (Either Frame AckContext)
+                           AckUpdate AckData
 
 data Update              = Update UpdateType (SChan Response)
 
@@ -86,22 +88,24 @@ sendMessage (SubscriptionManager updateChan) destination frame = do
     sync $ sendEvt updateChan $ Update (GotMessage destination frame) responseChan
     sync $ recvEvt responseChan
 
-ackLoop :: SChan (Either Frame AckContext) -> SChan Update -> ClientAcks -> IO ()
+ackLoop :: SChan AckData -> SChan Update -> ClientAcks -> IO ()
 ackLoop ackChan updateChan clientAcks = do
     ackData     <- sync $ recvEvt ackChan
     clientAcks' <- handleAck ackData clientAcks
     ackLoop ackChan updateChan clientAcks'
 
-handleAck :: Either Frame AckContext -> ClientAcks -> IO ClientAcks
-handleAck ackData clientAcks = return clientAcks
+handleAck :: AckData -> ClientAcks -> IO ClientAcks
+handleAck ackData clientAcks = case ackData of
+    Left _ -> return clientAcks
+    Right context@(AckContext _ messageId (ClientSub clientId _ _ _) _) -> return clientAcks
 
-updateLoop :: SChan Update -> SChan (Either Frame AckContext) -> Subscriptions -> IO ()
+updateLoop :: SChan Update -> SChan AckData -> Subscriptions -> IO ()
 updateLoop updateChan ackChan subs = do
     update  <- sync $ recvEvt updateChan
     subs' <- handleUpdate update subs updateChan ackChan
     updateLoop updateChan ackChan subs'
 
-handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan (Either Frame AckContext) -> IO Subscriptions
+handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan AckData -> IO Subscriptions
 -- Add
 handleUpdate (Update (Add dest clientSub) rChan) subscriptions _ _ = do
     forkIO $ sync $ sendEvt rChan Success
@@ -135,15 +139,16 @@ removeSubscription clientId subId subs@(Subscriptions subMap subIds) =
                 Nothing      -> Subscriptions subMap subIds'
         Nothing          -> subs
 
-handleMessage :: Frame -> Destination -> Subscriptions -> SChan Response -> SChan (Either Frame AckContext) -> IO ()
+handleMessage :: Frame -> Destination -> Subscriptions -> SChan Response -> SChan AckData -> IO ()
 handleMessage frame dest (Subscriptions subMap _) responseChan ackChan =
     case HM.lookup dest subMap of
         Just clientSubs -> do
-            unique <- newUnique
-            frame'  <- return $ addFrameHeaderFront (messageIdHeader $ show $ hashUnique unique) frame
+            unique    <- newUnique
+            messageId <- return $ show $ hashUnique unique 
+            frame'    <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
             forkIO $ sync $ sendEvt responseChan Success
             clientSub <- sync $ clientChoiceEvt frame' clientSubs
-            forkIO $ sync $ sendEvt ackChan (Right (AckContext frame' clientSub []))
+            forkIO $ sync $ sendEvt ackChan (Right (AckContext frame' messageId clientSub []))
             return ()
         Nothing -> sync $ sendEvt responseChan (Error "No subscribers") 
 
@@ -158,3 +163,7 @@ partialClientChoiceEvt frame sub@(ClientSub _ _ _ frameHandler) =
 transformFrame :: Frame -> ClientSub -> Frame
 transformFrame (Frame _ headers body) (ClientSub _ subId _ _) = 
     Frame MESSAGE (addHeaderFront (subscriptionHeader subId) headers) body
+
+getClientId :: AckData -> ClientId
+getClientId (Left (ClientAckResponse id _))                 = id
+getClientId (Right (AckContext _ _ (ClientSub id _ _ _) _)) = id
