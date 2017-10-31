@@ -168,8 +168,10 @@ handleSendFrame frame console subManager = case getDestination frame of
     Just dest -> do
         response <- sendMessage subManager dest frame
         case response of
-            Success -> return ()
-            Error s -> log console $ "There was an error sending the message: " ++ s
+            Success response -> case response of
+                Just msg -> log console msg
+                Nothing  -> return ()
+            Error s     -> log console $ "There was an error sending the message: " ++ s
     Nothing   -> throw NoDestinationHeader
 
 -- |Notify the SubscriptionManager that a new SUBSCRIBE Frame was received
@@ -187,8 +189,8 @@ getNewSub _ Nothing _ _ _ _ = throw NoIdHeader
 getNewSub (Just dest) (Just subId) ackType handler subManager clientId = do
     response <- subscribe subManager dest clientId subId ackType handler
     case response of 
-        Success -> return ()
-        Error s -> error s
+        Success _ -> return ()
+        Error s   -> error s
 
 selectAckType :: Maybe AckType -> AckType
 selectAckType (Just ackType) = ackType

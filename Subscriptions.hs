@@ -56,7 +56,7 @@ data UpdateType          = Add Destination ClientSub |
 
 data Update              = Update UpdateType (SChan Response)
 
-data Response            = Success | Error String
+data Response            = Success (Maybe String) | Error String
 
 data SubscriptionManager = SubscriptionManager (SChan Update)
 
@@ -189,11 +189,11 @@ updateLoop updateChan ackChan subs = do
 handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan AckUpdate -> IO Subscriptions
 -- Add
 handleUpdate (Update (Add dest clientSub) rChan) subscriptions _ _ = do
-    forkIO $ sync $ sendEvt rChan Success
+    forkIO $ sync $ sendEvt rChan (Success Nothing)
     return $ addSubscription dest clientSub subscriptions
 -- Remove
 handleUpdate (Update (Remove clientId subId) rChan) subs _ _ = do
-    forkIO $ sync $ sendEvt rChan Success
+    forkIO $ sync $ sendEvt rChan (Success Nothing)
     return $ removeSubscription clientId subId subs
 -- GotMessage
 handleUpdate (Update (GotMessage dest frame) rChan) subs _ ackChan = do
@@ -228,7 +228,7 @@ handleMessage frame dest (Subscriptions subMap _) responseChan ackChan =
             unique    <- newUnique
             messageId <- return $ show $ hashUnique unique 
             frame'    <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
-            forkIO $ sync $ sendEvt responseChan Success
+            forkIO $ sync $ sendEvt responseChan (Success Nothing)
             clientSub <- sync $ clientChoiceEvt frame' clientSubs
             case (getSubAckType clientSub) of
                 Auto -> do
