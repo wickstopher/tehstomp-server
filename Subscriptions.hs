@@ -52,6 +52,7 @@ data ClientAckResponse   = ClientAckResponse ClientId MessageId Frame
 data UpdateType          = Add Destination ClientSub |
                            Remove ClientId SubscriptionId |
                            GotMessage Destination Frame |
+                           ResendMessage Destination Frame [ClientId] MessageId |
                            Ack ClientAckResponse
 
 data Update              = Update UpdateType (SChan Response)
@@ -132,53 +133,22 @@ handleAckPair context@(AckContext frame msgId clId ackType sentClients) cmd clie
     case cmd of 
         ACK  -> putStrLn $ "Got an ACK response from client " ++ (show clId) ++ " for message ID " ++ (show msgId)
         NACK -> do
-            forkIO $ handleNack context updateChan
+            case ackType of
+                Client           -> forkIO $ handleNack (elems ackMap) updateChan
+                ClientIndividual -> forkIO $ handleNack [context] updateChan
             putStrLn $ "Got a NACK response from client " ++ (show clId) ++ " for messsage ID " ++ (show msgId)
     case ackType of
         Client           -> return $ HM.delete clId clientAcks
         ClientIndividual -> return $ HM.insert clId (HM.delete msgId ackMap, HM.delete msgId responseMap) clientAcks
 
-handleNack :: AckContext -> SChan Update -> IO ()
-handleNack context updateChan = return ()
+handleNack :: [AckContext] -> SChan Update -> IO ()
+handleNack contexts updateChan = mapM_ (resendContextFrame updateChan) contexts
 
--- handleAck :: Ack-> ClientAcks -> SChan Update -> IO ClientAcks
--- handleAck ackData clientAcks updateChan = let clientId = (getAckClientId ackData) in
---     case HM.lookup clientId clientAcks of
---         Just ackMap -> case HM.lookup (getAckMessageId ackData) ackMap of
---             Just ackData' -> handleAckData ackData ackData' clientAcks ackMap updateChan
---             Nothing -> return clientAcks
---         Nothing     -> return $ HM.insert clientId (HM.singleton (getAckMessageId ackData) ackData) clientAcks
-
--- handleAckData :: AckData -> AckData -> ClientAcks -> AckMap -> SChan Update -> IO ClientAcks
--- handleAckData right@(Right _) left@(Left _) clientAcks ackMap updateChan = handleAckData left right clientAcks ackMap updateChan
--- handleAckData 
---     (Left (ClientAckResponse clientId _ responseFrame)) 
---     (Right context@(AckContext originalFrame messageId _ ackType sentToClients)) 
---     clientAcks
---     ackMap 
---     updateChan = do
---         case (getCommand responseFrame) of
---             ACK  -> return ()
---             NACK -> case ackType of
---                 Client -> do
---                     resendNacks [originalFrame] (insertSentClient clientId context) updateChan
---                 ClientIndividual ->
---                     resendNacks (ackDataToFrames $ HM.elems ackMap) (insertSentClient clientId context) updateChan
---         return $ updateAckMap ackType ackMap clientId messageId clientAcks
-
--- ackDataToFrames :: [AckData] -> [Frame]
--- ackDataToFrames []       = []
--- ackDataToFrames (e:rest) = case e of
---     Right (AckContext frame _ _ _ _) -> frame : (ackDataToFrames rest)
---     _                                -> (ackDataToFrames rest)
-
--- updateAckMap :: AckType -> AckMap -> ClientId -> MessageId -> ClientAcks -> ClientAcks
--- updateAckMap ackType ackMap clientId messageId clientAcks = case ackType of
---     Client           -> HM.delete clientId clientAcks
---     ClientIndividual -> HM.insert clientId (HM.delete messageId ackMap) clientAcks
-
--- resendNacks :: [Frame] -> AckContext -> SChan Update -> IO ()
--- resendNacks frames ackContext updateChan = return ()
+resendContextFrame :: SChan Update -> AckContext -> IO Response
+resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
+    responseChan <- sync newSChan
+    forkIO $ sync $ sendEvt updateChan (Update (ResendMessage (_getDestination frame) frame sentClients msgId) responseChan)
+    sync $ recvEvt responseChan
 
 updateLoop :: SChan Update -> SChan AckUpdate -> Subscriptions -> IO ()
 updateLoop updateChan ackChan subs = do
@@ -197,7 +167,11 @@ handleUpdate (Update (Remove clientId subId) rChan) subs _ _ = do
     return $ removeSubscription clientId subId subs
 -- GotMessage
 handleUpdate (Update (GotMessage dest frame) rChan) subs _ ackChan = do
-    forkIO $ handleMessage frame dest subs rChan ackChan
+    forkIO $ handleMessage frame dest subs [] Nothing rChan ackChan
+    return subs
+-- Resend message due to NACK response
+handleUpdate (Update (ResendMessage dest frame sentClients messageId) rChan) subs _ ackChan = do
+    forkIO $ handleMessage frame dest subs sentClients (Just messageId) rChan ackChan
     return subs
 -- Ack response from client
 handleUpdate (Update (Ack clientResponse) rChan) subs _ ackChan = do
@@ -221,23 +195,30 @@ removeSubscription clientId subId subs@(Subscriptions subMap subIds) =
                 Nothing      -> Subscriptions subMap subIds'
         Nothing          -> subs
 
-handleMessage :: Frame -> Destination -> Subscriptions -> SChan Response -> SChan AckUpdate -> IO ()
-handleMessage frame dest (Subscriptions subMap _) responseChan ackChan =
+handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan Response -> SChan AckUpdate -> IO ()
+handleMessage frame dest (Subscriptions subMap _) sentClients maybeId responseChan ackChan =
     case HM.lookup dest subMap of
         Just clientSubs -> do
-            unique    <- newUnique
-            messageId <- return $ show $ hashUnique unique 
-            frame'    <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
+            messageId    <- getNewMessageId maybeId
+            frame'       <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
             forkIO $ sync $ sendEvt responseChan (Success Nothing)
-            clientSub <- sync $ clientChoiceEvt frame' clientSubs
+            clientSub    <- sync $ clientChoiceEvt frame' clientSubs
+            clientId     <- return $ getSubClientId clientSub
+            context      <- return $ AckContext frame messageId clientId (getSubAckType clientSub) (clientId:sentClients)
             case (getSubAckType clientSub) of
-                Auto -> do
-                    putStrLn "nothing to do!"
+                Auto -> return ()
+                _    -> do
+                    forkIO $ sync $ sendEvt ackChan (Right context)
                     return ()
-                _                -> do
-                    forkIO $ sync $ sendEvt ackChan (Right (AckContext frame' messageId (getSubClientId clientSub) (getSubAckType clientSub) []))
-                    return ()
-        Nothing -> sync $ sendEvt responseChan (Error "No subscribers") 
+        Nothing -> sync $ sendEvt responseChan (Error "No subscribers")
+
+getNewMessageId :: Maybe MessageId -> IO MessageId
+getNewMessageId maybeId = case maybeId of
+    Just messageId -> return messageId
+    Nothing        -> do
+        unique <- newUnique
+        return $ show $ hashUnique unique
+
 
 clientChoiceEvt :: Frame -> HashMap ClientId ClientSub -> Evt ClientSub
 clientChoiceEvt frame = HM.foldr (partialClientChoiceEvt frame) neverEvt
