@@ -66,16 +66,11 @@ getSubClientId (ClientSub id _ _ _ ) = id
 getSubAckType :: ClientSub -> AckType
 getSubAckType (ClientSub _ _ ack _) = ack
 
--- getAckClientId :: AckData -> ClientId
--- getAckClientId (Left (ClientAckResponse id _ _)) = id
--- getAckClientId (Right (AckContext _ _ id _ _))   = id
-
--- getAckMessageId :: AckData -> MessageId
--- getAckMessageId (Left (ClientAckResponse _ id _)) = id
--- getAckMessageId (Right (AckContext _ id _ _ _))   = id
-
 insertSentClient :: ClientId -> AckContext -> AckContext
 insertSentClient clientId (AckContext f m c a ids) = (AckContext f m c a (clientId:ids))
+
+getResponseCommand :: ClientAckResponse -> Command
+getResponseCommand (ClientAckResponse _ _ f) = getCommand f
 
 initManager :: IO SubscriptionManager
 initManager = do
@@ -112,7 +107,39 @@ ackLoop ackChan updateChan clientAcks = do
     ackLoop ackChan updateChan clientAcks'
 
 handleAck :: AckUpdate -> ClientAcks -> SChan Update -> IO ClientAcks
-handleAck _ clientAcks _ = return clientAcks
+handleAck ackUpdate clientAcks updateChan = case ackUpdate of
+    Left clientAckResponse -> handleClientAckResponse clientAckResponse clientAcks updateChan
+    Right ackContext       -> handleAckContext ackContext clientAcks updateChan
+
+handleClientAckResponse :: ClientAckResponse -> ClientAcks -> SChan Update -> IO ClientAcks
+handleClientAckResponse response@(ClientAckResponse clientId msgId frame) clientAcks updateChan = 
+    case HM.lookup clientId clientAcks of
+        Just (ackMap, responseMap) -> case HM.lookup msgId ackMap of
+            Just context -> handleAckPair context (getResponseCommand response) clientAcks updateChan ackMap responseMap
+            Nothing -> return $ HM.insert clientId (ackMap, HM.insert msgId  response responseMap) clientAcks
+        Nothing -> return $ HM.insert clientId (HM.empty, HM.singleton msgId response) clientAcks
+
+handleAckContext :: AckContext -> ClientAcks -> SChan Update -> IO ClientAcks
+handleAckContext context@(AckContext frame msgId clientId ackType sentClients) clientAcks updateChan =
+    case HM.lookup clientId clientAcks of
+        Just (ackMap, responseMap) -> case HM.lookup msgId responseMap of
+            Just response -> handleAckPair context (getResponseCommand response) clientAcks updateChan ackMap responseMap
+            Nothing -> return $ HM.insert clientId (HM.insert msgId context ackMap, responseMap) clientAcks
+        Nothing -> return $ HM.insert clientId (HM.singleton msgId context, HM.empty) clientAcks
+
+handleAckPair :: AckContext -> Command -> ClientAcks -> SChan Update -> AckContextMap -> AckResponseMap ->IO ClientAcks
+handleAckPair context@(AckContext frame msgId clId ackType sentClients) cmd clientAcks updateChan ackMap responseMap = do
+    case cmd of 
+        ACK  -> putStrLn $ "Got an ACK response from client " ++ (show clId) ++ " for message ID " ++ (show msgId)
+        NACK -> do
+            forkIO $ handleNack context updateChan
+            putStrLn $ "Got a NACK response from client " ++ (show clId) ++ " for messsage ID " ++ (show msgId)
+    case ackType of
+        Client           -> return $ HM.delete clId clientAcks
+        ClientIndividual -> return $ HM.insert clId (HM.delete msgId ackMap, HM.delete msgId responseMap) clientAcks
+
+handleNack :: AckContext -> SChan Update -> IO ()
+handleNack context updateChan = return ()
 
 -- handleAck :: Ack-> ClientAcks -> SChan Update -> IO ClientAcks
 -- handleAck ackData clientAcks updateChan = let clientId = (getAckClientId ackData) in
@@ -172,10 +199,10 @@ handleUpdate (Update (Remove clientId subId) rChan) subs _ _ = do
 handleUpdate (Update (GotMessage dest frame) rChan) subs _ ackChan = do
     forkIO $ handleMessage frame dest subs rChan ackChan
     return subs
+-- Ack response from client
 handleUpdate (Update (Ack clientResponse) rChan) subs _ ackChan = do
     forkIO $ sync $ sendEvt ackChan (Left clientResponse)
     return subs
-
 
 addSubscription :: Destination -> ClientSub -> Subscriptions -> Subscriptions
 addSubscription dest clientSub@(ClientSub clientId subId _ _) (Subscriptions subMap subIds) =
