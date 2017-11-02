@@ -202,7 +202,7 @@ handleMessage frame dest (Subscriptions subMap _) sentClients maybeId responseCh
             messageId    <- getNewMessageId maybeId
             frame'       <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
             forkIO $ sync $ sendEvt responseChan (Success Nothing)
-            clientSub    <- sync $ clientChoiceEvt frame' clientSubs
+            clientSub    <- sync $ clientChoiceEvt frame' messageId clientSubs
             clientId     <- return $ getSubClientId clientSub
             context      <- return $ AckContext frame messageId clientId (getSubAckType clientSub) (clientId:sentClients)
             case (getSubAckType clientSub) of
@@ -219,15 +219,18 @@ getNewMessageId maybeId = case maybeId of
         unique <- newUnique
         return $ show $ hashUnique unique
 
+clientChoiceEvt :: Frame -> MessageId -> HashMap ClientId ClientSub -> Evt ClientSub
+clientChoiceEvt frame messageId = HM.foldr (partialClientChoiceEvt frame messageId) neverEvt
 
-clientChoiceEvt :: Frame -> HashMap ClientId ClientSub -> Evt ClientSub
-clientChoiceEvt frame = HM.foldr (partialClientChoiceEvt frame) neverEvt
-
-partialClientChoiceEvt :: Frame -> ClientSub -> Evt ClientSub -> Evt ClientSub
-partialClientChoiceEvt frame sub@(ClientSub _ _ _ frameHandler) = 
-    let frame' = transformFrame frame sub in
+partialClientChoiceEvt :: Frame -> MessageId -> ClientSub -> Evt ClientSub -> Evt ClientSub
+partialClientChoiceEvt frame messageId sub@(ClientSub _ _ _ frameHandler) = 
+    let frame' = transformFrame frame messageId sub in
         chooseEvt $ (putEvt frame' frameHandler) `thenEvt` (\_ -> alwaysEvt sub)
 
-transformFrame :: Frame -> ClientSub -> Frame
-transformFrame (Frame _ headers body) (ClientSub _ subId _ _) = 
-    Frame MESSAGE (addHeaderFront (subscriptionHeader subId) headers) body
+transformFrame :: Frame -> MessageId -> ClientSub -> Frame
+transformFrame (Frame _ headers body) messageId (ClientSub _ subId ackType _) = 
+    let frame = Frame MESSAGE (addHeaderFront (subscriptionHeader subId) headers) body in
+        case ackType of 
+            Auto -> frame
+            _    -> addFrameHeaderFront (ackHeader messageId) frame
+
