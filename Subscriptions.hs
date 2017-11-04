@@ -6,6 +6,7 @@ module Subscriptions (
     initManager,
     unsubscribe,
     subscribe,
+    sendAckResponse,
     sendMessage
 ) where
 
@@ -101,6 +102,12 @@ sendMessage (SubscriptionManager updateChan) destination frame = do
     sync $ sendEvt updateChan $ Update (GotMessage destination frame) responseChan
     sync $ recvEvt responseChan
 
+sendAckResponse :: SubscriptionManager -> ClientId -> Frame -> IO Response
+sendAckResponse (SubscriptionManager updateChan) clientId frame = do
+    responseChan <- sync newSChan
+    sync $ sendEvt updateChan $ Update (Ack $ ClientAckResponse clientId (_getId frame) frame) responseChan
+    return $ Success Nothing
+
 ackLoop :: SChan AckUpdate -> SChan Update -> ClientAcks -> IO ()
 ackLoop ackChan updateChan clientAcks = do
     update      <- sync $ recvEvt ackChan
@@ -128,7 +135,7 @@ handleAckContext context@(AckContext frame msgId clientId ackType sentClients) c
             Nothing -> return $ HM.insert clientId (HM.insert msgId context ackMap, responseMap) clientAcks
         Nothing -> return $ HM.insert clientId (HM.singleton msgId context, HM.empty) clientAcks
 
-handleAckPair :: AckContext -> Command -> ClientAcks -> SChan Update -> AckContextMap -> AckResponseMap ->IO ClientAcks
+handleAckPair :: AckContext -> Command -> ClientAcks -> SChan Update -> AckContextMap -> AckResponseMap -> IO ClientAcks
 handleAckPair context@(AckContext frame msgId clId ackType sentClients) cmd clientAcks updateChan ackMap responseMap = do
     case cmd of 
         ACK  -> putStrLn $ "Got an ACK response from client " ++ (show clId) ++ " for message ID " ++ (show msgId)

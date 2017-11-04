@@ -152,6 +152,12 @@ handleNextFrame frameHandler console subManager clientId = do
                 SUBSCRIBE  -> do
                     newSub <- handleSubscriptionRequest frameHandler frame subManager clientId
                     return $ Just command
+                ACK        -> do
+                    sendAckResponse subManager clientId frame
+                    return $ Just command
+                NACK       -> do
+                    sendAckResponse subManager clientId frame
+                    return $ Just command
                 _          -> do
                     log console "Handler not yet implemented"
                     return $ Just command
