@@ -138,12 +138,11 @@ handleAckContext context@(AckContext frame msgId clientId ackType sentClients) c
 handleAckPair :: AckContext -> Command -> ClientAcks -> SChan Update -> AckContextMap -> AckResponseMap -> IO ClientAcks
 handleAckPair context@(AckContext frame msgId clId ackType sentClients) cmd clientAcks updateChan ackMap responseMap = do
     case cmd of 
-        ACK  -> putStrLn $ "Got an ACK response from client " ++ (show clId) ++ " for message ID " ++ (show msgId)
-        NACK -> do
+        ACK  -> return ()
+        NACK ->
             case ackType of
-                Client           -> forkIO $ handleNack (elems ackMap) updateChan
-                ClientIndividual -> forkIO $ handleNack [context] updateChan
-            putStrLn $ "Got a NACK response from client " ++ (show clId) ++ " for messsage ID " ++ (show msgId)
+                Client           -> do { forkIO $ handleNack (elems ackMap) updateChan ; return () }
+                ClientIndividual -> do { forkIO $ handleNack [context] updateChan ; return () }
     case ackType of
         Client           -> return $ HM.delete clId clientAcks
         ClientIndividual -> return $ HM.insert clId (HM.delete msgId ackMap, HM.delete msgId responseMap) clientAcks
@@ -209,7 +208,7 @@ handleMessage frame dest (Subscriptions subMap _) sentClients maybeId responseCh
             messageId    <- getNewMessageId maybeId
             frame'       <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
             forkIO $ sync $ sendEvt responseChan (Success Nothing)
-            clientSub    <- sync $ clientChoiceEvt frame' messageId clientSubs
+            clientSub    <- sync $ clientChoiceEvt frame' messageId sentClients clientSubs
             clientId     <- return $ getSubClientId clientSub
             context      <- return $ AckContext frame messageId clientId (getSubAckType clientSub) (clientId:sentClients)
             case (getSubAckType clientSub) of
@@ -226,12 +225,12 @@ getNewMessageId maybeId = case maybeId of
         unique <- newUnique
         return $ show $ hashUnique unique
 
-clientChoiceEvt :: Frame -> MessageId -> HashMap ClientId ClientSub -> Evt ClientSub
-clientChoiceEvt frame messageId = HM.foldr (partialClientChoiceEvt frame messageId) neverEvt
+clientChoiceEvt :: Frame -> MessageId -> [ClientId] -> HashMap ClientId ClientSub -> Evt ClientSub
+clientChoiceEvt frame messageId sentClients = HM.foldr (partialClientChoiceEvt frame messageId sentClients) neverEvt
 
-partialClientChoiceEvt :: Frame -> MessageId -> ClientSub -> Evt ClientSub -> Evt ClientSub
-partialClientChoiceEvt frame messageId sub@(ClientSub _ _ _ frameHandler) = 
-    let frame' = transformFrame frame messageId sub in
+partialClientChoiceEvt :: Frame -> MessageId -> [ClientId] -> ClientSub -> Evt ClientSub -> Evt ClientSub
+partialClientChoiceEvt frame messageId sentClients sub@(ClientSub clientId _ _ frameHandler) = 
+    if clientId `elem` sentClients then (chooseEvt neverEvt) else let frame' = transformFrame frame messageId sub in
         chooseEvt $ (putEvt frame' frameHandler) `thenEvt` (\_ -> alwaysEvt sub)
 
 transformFrame :: Frame -> MessageId -> ClientSub -> Frame
