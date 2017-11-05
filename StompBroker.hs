@@ -130,6 +130,7 @@ connectionLoop frameHandler console subManager clientId = do
             Just _          -> connectionLoop frameHandler console subManager clientId
             Nothing         -> do
                 close frameHandler
+                clientDisconnected subManager clientId
                 return ()
 
 -- |This function blocks until a Frame is received from the client, and then processes that Frame appropriately.
