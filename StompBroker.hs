@@ -145,6 +145,7 @@ handleNextFrame frameHandler console subManager clientId = do
                 DISCONNECT -> do 
                     log console "Disconnect request received; closing connection to client"
                     close frameHandler
+                    clientDisconnected subManager clientId
                     return $ Just command
                 SEND       -> do 
                     handleSendFrame frame console subManager

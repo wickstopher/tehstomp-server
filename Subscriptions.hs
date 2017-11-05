@@ -3,6 +3,7 @@ module Subscriptions (
     ClientId,
     Response(..),
     SubscriptionManager,
+    clientDisconnected,
     initManager,
     unsubscribe,
     subscribe,
@@ -21,15 +22,14 @@ type ClientId            = Int
 type MessageId           = String
 type SubscriptionId      = String
 type Destination         = String
-type AckUpdate           = Either ClientAckResponse AckContext
 
 -- |A HashMap to keep track of subscriptions to a given Destination.
 type SubMap              = HashMap Destination (HashMap ClientId ClientSub)
 
 -- |A HashMap to track which ClientId/SubscriptionId pairs are on which Destination. Allows for
---  efficient removal of client subscriptions, as a cli9ent UNSUBSCRIBE frame only contains the
+--  efficient removal of client subscriptions, as a client UNSUBSCRIBE frame only contains the
 --  SubscriptionId, not the Destination.
-type SubIds              = HashMap (ClientId, SubscriptionId) Destination
+type ClientDests         = HashMap ClientId (HashMap SubscriptionId Destination)
 
 type AckResponseMap      = HashMap MessageId ClientAckResponse
 
@@ -38,7 +38,7 @@ type AckContextMap       = HashMap MessageId AckContext
 -- |ClientAcks stores information about pending ACK situations for individual clients.
 type ClientAcks          = HashMap ClientId (AckContextMap, AckResponseMap)
 
-data Subscriptions       = Subscriptions SubMap SubIds
+data Subscriptions       = Subscriptions SubMap ClientDests
 
 -- |A ClientSub encapsulates information about a client subscription.
 data ClientSub           = ClientSub ClientId SubscriptionId AckType FrameHandler
@@ -50,11 +50,14 @@ data AckContext          = AckContext Frame MessageId ClientId AckType [ClientId
 
 data ClientAckResponse   = ClientAckResponse ClientId MessageId Frame
 
+data AckUpdate           = Response ClientAckResponse | Context AckContext | ClientDisconnected ClientId
+
 data UpdateType          = Add Destination ClientSub |
                            Remove ClientId SubscriptionId |
                            GotMessage Destination Frame |
                            ResendMessage Destination Frame [ClientId] MessageId |
-                           Ack ClientAckResponse
+                           Ack ClientAckResponse |
+                           Disconnected ClientId
 
 data Update              = Update UpdateType (SChan Response)
 
@@ -108,6 +111,12 @@ sendAckResponse (SubscriptionManager updateChan) clientId frame = do
     sync $ sendEvt updateChan $ Update (Ack $ ClientAckResponse clientId (_getId frame) frame) responseChan
     return $ Success Nothing
 
+clientDisconnected :: SubscriptionManager -> ClientId -> IO Response
+clientDisconnected (SubscriptionManager updateChan) clientId = do
+    responseChan <- sync newSChan
+    sync $ sendEvt updateChan $ Update (Disconnected clientId) responseChan
+    return $ Success Nothing
+
 ackLoop :: SChan AckUpdate -> SChan Update -> ClientAcks -> IO ()
 ackLoop ackChan updateChan clientAcks = do
     update      <- sync $ recvEvt ackChan
@@ -116,8 +125,9 @@ ackLoop ackChan updateChan clientAcks = do
 
 handleAck :: AckUpdate -> ClientAcks -> SChan Update -> IO ClientAcks
 handleAck ackUpdate clientAcks updateChan = case ackUpdate of
-    Left clientAckResponse -> handleClientAckResponse clientAckResponse clientAcks updateChan
-    Right ackContext       -> handleAckContext ackContext clientAcks updateChan
+    Response clientAckResponse  -> handleClientAckResponse clientAckResponse clientAcks updateChan
+    Context ackContext          -> handleAckContext ackContext clientAcks updateChan
+    ClientDisconnected clientId -> handleClientDisconnect clientAcks clientId updateChan
 
 handleClientAckResponse :: ClientAckResponse -> ClientAcks -> SChan Update -> IO ClientAcks
 handleClientAckResponse response@(ClientAckResponse clientId msgId frame) clientAcks updateChan = 
@@ -135,6 +145,16 @@ handleAckContext context@(AckContext frame msgId clientId ackType sentClients) c
             Nothing -> return $ HM.insert clientId (HM.insert msgId context ackMap, responseMap) clientAcks
         Nothing -> return $ HM.insert clientId (HM.singleton msgId context, HM.empty) clientAcks
 
+handleClientDisconnect :: ClientAcks -> ClientId -> SChan Update -> IO ClientAcks
+handleClientDisconnect clientAcks clientId updateChan = case HM.lookup clientId clientAcks of
+    Just (contextMap, _) -> do
+        mapM_ (resendContext updateChan) contextMap
+        return $ HM.delete clientId clientAcks
+    Nothing              -> return clientAcks
+
+resendContext :: SChan Update -> AckContext -> IO ThreadId
+resendContext updateChan ackContext = forkIO $ resendContextFrame updateChan ackContext
+
 handleAckPair :: AckContext -> Command -> ClientAcks -> SChan Update -> AckContextMap -> AckResponseMap -> IO ClientAcks
 handleAckPair context@(AckContext frame msgId clId ackType sentClients) cmd clientAcks updateChan ackMap responseMap = do
     case cmd of 
@@ -150,11 +170,12 @@ handleAckPair context@(AckContext frame msgId clId ackType sentClients) cmd clie
 handleNack :: [AckContext] -> SChan Update -> IO ()
 handleNack contexts updateChan = mapM_ (resendContextFrame updateChan) contexts
 
-resendContextFrame :: SChan Update -> AckContext -> IO Response
+resendContextFrame :: SChan Update -> AckContext -> IO ()
 resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
     responseChan <- sync newSChan
     forkIO $ sync $ sendEvt updateChan (Update (ResendMessage (_getDestination frame) frame sentClients msgId) responseChan)
     sync $ recvEvt responseChan
+    return ()
 
 resendTimedOutFrame :: Frame -> SChan Update -> Destination -> [ClientId] -> MessageId -> IO ()
 resendTimedOutFrame frame updateChan dest sentClients messageId = do
@@ -188,25 +209,46 @@ handleUpdate (Update (ResendMessage dest frame sentClients messageId) rChan) sub
     return subs
 -- Ack response from client
 handleUpdate (Update (Ack clientResponse) rChan) subs _ ackChan = do
-    forkIO $ sync $ sendEvt ackChan (Left clientResponse)
+    forkIO $ sync $ sendEvt ackChan (Response clientResponse)
     return subs
+-- Client disconnected
+handleUpdate (Update (Disconnected clientId) rChan) subs@(Subscriptions subMap clientDests) _ ackChan = do
+    forkIO $ sync $ sendEvt ackChan (ClientDisconnected clientId)
+    return $ removeAllClientSubs subs clientId
+
+removeAllClientSubs :: Subscriptions -> ClientId -> Subscriptions
+removeAllClientSubs subs@(Subscriptions subMap clientDests) clientId = case HM.lookup clientId clientDests of
+    Just destMap -> Subscriptions (deleteSubs subMap clientId (elems destMap)) (HM.delete clientId clientDests)
+    Nothing      -> subs
+
+deleteSubs :: SubMap -> ClientId -> [Destination] -> SubMap
+deleteSubs subMap _ []                 = subMap
+deleteSubs subMap clientId (dest:rest) = case HM.lookup dest subMap of
+    Just clientSubs -> deleteSubs (HM.insert dest (HM.delete clientId clientSubs) subMap) clientId rest
+    Nothing         -> deleteSubs subMap clientId rest
 
 addSubscription :: Destination -> ClientSub -> Subscriptions -> Subscriptions
-addSubscription dest clientSub@(ClientSub clientId subId _ _) (Subscriptions subMap subIds) =
+addSubscription dest clientSub@(ClientSub clientId subId _ _) (Subscriptions subMap clientDests) =
     let clientSubs' = case HM.lookup dest subMap of
             Just clientSubs -> HM.insert clientId clientSub clientSubs
             Nothing         -> HM.singleton clientId clientSub
+        destMap'    = case HM.lookup clientId clientDests of
+            Just destMap    -> HM.insert subId dest destMap
+            Nothing         -> HM.singleton subId dest
     in
-        Subscriptions (insert dest clientSubs' subMap) (insert (clientId, subId) dest subIds)
+        Subscriptions (insert dest clientSubs' subMap) (insert clientId destMap' clientDests)
 
 removeSubscription :: ClientId -> SubscriptionId -> Subscriptions -> Subscriptions
-removeSubscription clientId subId subs@(Subscriptions subMap subIds) =
-    case HM.lookup (clientId, subId) subIds of
-        Just destination -> let subIds' = HM.delete (clientId, subId) subIds in
-            case HM.lookup destination subMap of
-                Just clients -> Subscriptions (HM.insert destination (HM.delete clientId clients) subMap) subIds'
-                Nothing      -> Subscriptions subMap subIds'
-        Nothing          -> subs
+removeSubscription clientId subId subs@(Subscriptions subMap clientDests) =
+    case HM.lookup clientId clientDests of
+        Just destMap ->
+            let clientDests' = HM.insert clientId (HM.delete subId destMap) clientDests
+            in case HM.lookup subId destMap of 
+                Just dest -> case HM.lookup dest subMap of
+                    Just clientSubs -> Subscriptions (HM.insert dest (HM.delete clientId clientSubs) subMap) clientDests'
+                    Nothing         -> Subscriptions subMap clientDests'
+                Nothing          -> Subscriptions subMap clientDests'
+        Nothing -> subs
 
 handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan Response -> SChan AckUpdate -> SChan Update -> IO ()
 handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId responseChan ackChan  updateChan =
@@ -223,7 +265,7 @@ handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId respo
                     case (getSubAckType clientSub) of
                         Auto -> return ()
                         _    -> do
-                            forkIO $ sync $ sendEvt ackChan (Right context)
+                            forkIO $ sync $ sendEvt ackChan (Context context)
                             return ()
                     sync $ sendEvt responseChan $ Success Nothing
                 Nothing -> do { forkIO $ resendTimedOutFrame frame updateChan dest sentClients messageId ; return () }
