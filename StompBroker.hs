@@ -2,13 +2,13 @@ import Control.Concurrent
 import Control.Exception
 import Data.ByteString as BS
 import Data.List as List
-import Data.Unique
 import Stomp.Frames.IO
 import Network.Socket hiding (close)
 import Prelude hiding (log)
 import System.IO as IO
 import System.Environment
 import Stomp.Frames hiding (subscribe)
+import Stomp.Increment
 import Stomp.TLogger
 import Subscriptions
 
@@ -25,16 +25,17 @@ instance Show ClientException where
 -- |Set up the environment and initialize the socket loop.
 main :: IO ()
 main = do
-    args       <- getArgs
-    port       <- processArgs args
-    console    <- dateTimeLogger stdout
-    subManager <- initManager
-    sock       <- socket AF_INET Stream 0
+    args        <- getArgs
+    port        <- processArgs args
+    console     <- dateTimeLogger stdout
+    subManager  <- initManager
+    sock        <- socket AF_INET Stream 0
+    incrementer <- newIncrementer
     setSocketOption sock ReuseAddr 1
     bind sock (SockAddrInet port iNADDR_ANY)
     listen sock 5
     log console $ "STOMP broker initiated on port " ++ (show port)
-    socketLoop sock console subManager
+    socketLoop sock console subManager incrementer
 
 -- |Process the command-line arguments.
 processArgs :: [String] -> IO PortNumber
@@ -42,29 +43,29 @@ processArgs (s:[]) = return $ fromIntegral ((read s)::Int)
 processArgs _      = return 2323
 
 -- |Loop as connections are received, forking off a new thread for each connection.
-socketLoop :: Socket -> Logger -> SubscriptionManager -> IO ()
-socketLoop sock console subManager = do
+socketLoop :: Socket -> Logger -> SubscriptionManager -> Incrementer -> IO ()
+socketLoop sock console subManager inc = do
     (uSock, _) <- accept sock
     addr <- getPeerName uSock
     log console $ "New connection received from " ++ (show addr)
     handle <- socketToHandle uSock ReadWriteMode
     hSetBuffering handle NoBuffering
     frameHandler <- initFrameHandler handle
-    forkIO $ negotiateConnection frameHandler (addTransform (appendTransform ("[" ++ show addr ++ "]")) console) subManager
-    socketLoop sock console subManager
+    forkIO $ negotiateConnection frameHandler (addTransform (appendTransform ("[" ++ show addr ++ "]")) console) subManager inc
+    socketLoop sock console subManager inc
 
 -- |Negotiate client connection. 
-negotiateConnection :: FrameHandler -> Logger -> SubscriptionManager -> IO ()
-negotiateConnection frameHandler console subManager = do
+negotiateConnection :: FrameHandler -> Logger -> SubscriptionManager -> Incrementer -> IO ()
+negotiateConnection frameHandler console subManager inc = do
     f <- get frameHandler
     case f of 
         NewFrame frame -> case (getCommand frame) of
             STOMP   -> do
                 log console "STOMP frame received; negotiating new connection"
-                handleNewConnection frameHandler frame console subManager
+                handleNewConnection frameHandler frame console subManager inc
             CONNECT -> do
                 log console "CONNECT frame received; negotiating new connection"
-                handleNewConnection frameHandler frame console subManager
+                handleNewConnection frameHandler frame console subManager inc
             _       -> do
                 log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
                 rejectConnection console frameHandler "Please initiate communications with a connection request"
@@ -76,15 +77,15 @@ negotiateConnection frameHandler console subManager = do
 -- |Handle a new client connection following the receipt of a CONNECT Frame. This ensures that there is a shared
 -- protocol version, and if there is, sends a CONNECTED Frame. and creates a new Unique (with respect to this 
 -- server instance) client ID, and initializes the connection loop that listens for Frames on the client's handle.
-handleNewConnection :: FrameHandler -> Frame -> Logger -> SubscriptionManager -> IO ()
-handleNewConnection frameHandler frame console subManager = let version = determineVersion frame in
+handleNewConnection :: FrameHandler -> Frame -> Logger -> SubscriptionManager -> Incrementer -> IO ()
+handleNewConnection frameHandler frame console subManager inc = let version = determineVersion frame in
     case version of
         Just v  -> do 
             sendConnectedResponse frameHandler v
-            uniqueId <- newUnique
+            clientId <- getNext inc
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
-            log console $ "Client unique ID is " ++ (show $ hashUnique uniqueId)
-            connectionLoop frameHandler console subManager (hashUnique uniqueId)
+            log console $ "Client unique ID is " ++ (show clientId)
+            connectionLoop frameHandler console subManager clientId
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection console frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
