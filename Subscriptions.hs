@@ -156,6 +156,13 @@ resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
     forkIO $ sync $ sendEvt updateChan (Update (ResendMessage (_getDestination frame) frame sentClients msgId) responseChan)
     sync $ recvEvt responseChan
 
+resendTimedOutFrame :: Frame -> SChan Update -> Destination -> [ClientId] -> MessageId -> IO ()
+resendTimedOutFrame frame updateChan dest sentClients messageId = do
+    responseChan <- sync newSChan
+    forkIO $ sync $ sendEvt updateChan (Update (ResendMessage dest frame sentClients messageId) responseChan)
+    sync $ recvEvt responseChan
+    return ()
+
 updateLoop :: SChan Update -> SChan AckUpdate -> Subscriptions -> IO ()
 updateLoop updateChan ackChan subs = do
     update  <- sync $ recvEvt updateChan
@@ -219,9 +226,7 @@ handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId respo
                             forkIO $ sync $ sendEvt ackChan (Right context)
                             return ()
                     sync $ sendEvt responseChan $ Success Nothing
-                Nothing -> do
-                    forkIO $ do { sendMessage (SubscriptionManager updateChan) dest frame ; return () }
-                    putStrLn "Timed Out"
+                Nothing -> do { forkIO $ resendTimedOutFrame frame updateChan dest sentClients messageId ; return () }
         Nothing -> sync $ sendEvt responseChan (Error "No subscribers")
 
 getNewMessageId :: Maybe MessageId -> IO MessageId
