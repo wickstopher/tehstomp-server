@@ -97,7 +97,7 @@ unsubscribe (SubscriptionManager updateChan) clientId subId = do
     sync $ recvEvt responseChan
 
 sendMessage :: SubscriptionManager -> Destination -> Frame -> IO Response
-sendMessage (SubscriptionManager updateChan) destination frame = do
+sendMessage manager@(SubscriptionManager updateChan) destination frame = do
     responseChan <- sync newSChan
     sync $ sendEvt updateChan $ Update (GotMessage destination frame) responseChan
     sync $ recvEvt responseChan
@@ -172,12 +172,12 @@ handleUpdate (Update (Remove clientId subId) rChan) subs _ _ = do
     forkIO $ sync $ sendEvt rChan (Success Nothing)
     return $ removeSubscription clientId subId subs
 -- GotMessage
-handleUpdate (Update (GotMessage dest frame) rChan) subs _ ackChan = do
-    forkIO $ handleMessage frame dest subs [] Nothing rChan ackChan
+handleUpdate (Update (GotMessage dest frame) rChan) subs updateChan ackChan = do
+    forkIO $ handleMessage frame dest subs [] Nothing rChan ackChan updateChan
     return subs
 -- Resend message due to NACK response
-handleUpdate (Update (ResendMessage dest frame sentClients messageId) rChan) subs _ ackChan = do
-    forkIO $ handleMessage frame dest subs sentClients (Just messageId) rChan ackChan
+handleUpdate (Update (ResendMessage dest frame sentClients messageId) rChan) subs updateChan ackChan = do
+    forkIO $ handleMessage frame dest subs sentClients (Just messageId) rChan ackChan updateChan
     return subs
 -- Ack response from client
 handleUpdate (Update (Ack clientResponse) rChan) subs _ ackChan = do
@@ -201,21 +201,27 @@ removeSubscription clientId subId subs@(Subscriptions subMap subIds) =
                 Nothing      -> Subscriptions subMap subIds'
         Nothing          -> subs
 
-handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan Response -> SChan AckUpdate -> IO ()
-handleMessage frame dest (Subscriptions subMap _) sentClients maybeId responseChan ackChan =
+handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan Response -> SChan AckUpdate -> SChan Update -> IO ()
+handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId responseChan ackChan  updateChan =
     case HM.lookup dest subMap of
         Just clientSubs -> do
+            sync $ sendEvt responseChan (Success Nothing)
             messageId    <- getNewMessageId maybeId
             frame'       <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
-            forkIO $ sync $ sendEvt responseChan (Success Nothing)
-            clientSub    <- sync $ clientChoiceEvt frame' messageId sentClients clientSubs
-            clientId     <- return $ getSubClientId clientSub
-            context      <- return $ AckContext frame messageId clientId (getSubAckType clientSub) (clientId:sentClients)
-            case (getSubAckType clientSub) of
-                Auto -> return ()
-                _    -> do
-                    forkIO $ sync $ sendEvt ackChan (Right context)
-                    return ()
+            maybeSub     <- sync $ clientChoiceEvt frame' messageId sentClients clientSubs
+            case maybeSub of
+                Just clientSub -> do
+                    clientId     <- return $ getSubClientId clientSub
+                    context      <- return $ AckContext frame messageId clientId (getSubAckType clientSub) (clientId:sentClients)
+                    case (getSubAckType clientSub) of
+                        Auto -> return ()
+                        _    -> do
+                            forkIO $ sync $ sendEvt ackChan (Right context)
+                            return ()
+                    sync $ sendEvt responseChan $ Success Nothing
+                Nothing -> do
+                    forkIO $ do { sendMessage (SubscriptionManager updateChan) dest frame ; return () }
+                    putStrLn "Timed Out"
         Nothing -> sync $ sendEvt responseChan (Error "No subscribers")
 
 getNewMessageId :: Maybe MessageId -> IO MessageId
@@ -225,13 +231,14 @@ getNewMessageId maybeId = case maybeId of
         unique <- newUnique
         return $ show $ hashUnique unique
 
-clientChoiceEvt :: Frame -> MessageId -> [ClientId] -> HashMap ClientId ClientSub -> Evt ClientSub
-clientChoiceEvt frame messageId sentClients = HM.foldr (partialClientChoiceEvt frame messageId sentClients) neverEvt
+clientChoiceEvt :: Frame -> MessageId -> [ClientId] -> HashMap ClientId ClientSub -> Evt (Maybe ClientSub)
+clientChoiceEvt frame messageId sentClients = HM.foldr (partialClientChoiceEvt frame messageId sentClients) 
+    $ (timeOutEvt 500000) `thenEvt` (\_ -> alwaysEvt Nothing)
 
-partialClientChoiceEvt :: Frame -> MessageId -> [ClientId] -> ClientSub -> Evt ClientSub -> Evt ClientSub
+partialClientChoiceEvt :: Frame -> MessageId -> [ClientId] -> ClientSub -> Evt (Maybe ClientSub) -> Evt (Maybe ClientSub)
 partialClientChoiceEvt frame messageId sentClients sub@(ClientSub clientId _ _ frameHandler) = 
     if clientId `elem` sentClients then (chooseEvt neverEvt) else let frame' = transformFrame frame messageId sub in
-        chooseEvt $ (putEvt frame' frameHandler) `thenEvt` (\_ -> alwaysEvt sub)
+        chooseEvt $ (putEvt frame' frameHandler) `thenEvt` (\_ -> alwaysEvt $ Just sub)
 
 transformFrame :: Frame -> MessageId -> ClientSub -> Frame
 transformFrame (Frame _ headers body) messageId (ClientSub _ subId ackType _) = 
