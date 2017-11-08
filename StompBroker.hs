@@ -14,13 +14,15 @@ import Subscriptions
 
 data ClientException = NoIdHeader |
                        NoDestinationHeader  |
-                       SubscriptionUpdate
+                       SubscriptionUpdate |
+                       NoIdInUnsubscribe
 
 instance Exception ClientException
 instance Show ClientException where
     show NoIdHeader          = "No id header present in request"
     show NoDestinationHeader = "No destination header present in request"
     show SubscriptionUpdate  = "There was an error processing the subscription request"
+    show NoIdInUnsubscribe   = "No subscription ID header present in unsubscribe request"
 
 -- |Set up the environment and initialize the socket loop.
 main :: IO ()
@@ -144,24 +146,27 @@ handleNextFrame frameHandler console subManager clientId = do
             log console $ "Received " ++ (show command) ++ " frame"
             handleReceiptRequest frameHandler frame console
             case command of
-                DISCONNECT -> do 
+                DISCONNECT  -> do 
                     log console "Disconnect request received; closing connection to client"
                     close frameHandler
                     clientDisconnected subManager clientId
                     return $ Just command
-                SEND       -> do 
+                SEND        -> do 
                     handleSendFrame frame console subManager
                     return $ Just command
-                SUBSCRIBE  -> do
-                    newSub <- handleSubscriptionRequest frameHandler frame subManager clientId
+                SUBSCRIBE   -> do
+                    handleSubscriptionRequest frameHandler frame subManager clientId
                     return $ Just command
-                ACK        -> do
+                UNSUBSCRIBE -> do
+                    handleUnsubscribeRequest subManager clientId frame
+                    return $ Just command
+                ACK         -> do
                     sendAckResponse subManager clientId frame
                     return $ Just command
-                NACK       -> do
+                NACK        -> do
                     sendAckResponse subManager clientId frame
                     return $ Just command
-                _          -> do
+                _           -> do
                     log console "Handler not yet implemented"
                     return $ Just command
         GotEof         -> do
@@ -190,6 +195,11 @@ handleSubscriptionRequest handler frame subManager clientId =
         maybeId   = getId frame
         ackType   = selectAckType (getAckType frame)
     in getNewSub maybeDest maybeId ackType handler subManager clientId
+
+handleUnsubscribeRequest:: SubscriptionManager -> ClientId -> Frame -> IO Response
+handleUnsubscribeRequest subManager clientId frame = case (getId frame) of 
+    Just subId -> unsubscribe subManager clientId subId
+    Nothing    -> throw NoIdInUnsubscribe
 
 -- |Helper function for handleSubscriptionRequest
 getNewSub :: Maybe String -> Maybe String -> AckType -> FrameHandler -> SubscriptionManager -> ClientId -> IO ()
