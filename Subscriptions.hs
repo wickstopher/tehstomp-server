@@ -19,7 +19,7 @@ import Stomp.Frames.IO
 import Stomp.Increment
 
 type ClientId            = Integer
-type MessageId           = String
+type MessageId           = Integer
 type SubscriptionId      = String
 type Destination         = String
 
@@ -109,7 +109,7 @@ sendMessage manager@(SubscriptionManager updateChan) destination frame = do
 sendAckResponse :: SubscriptionManager -> ClientId -> Frame -> IO Response
 sendAckResponse (SubscriptionManager updateChan) clientId frame = do
     responseChan <- sync newSChan
-    sync $ sendEvt updateChan $ Update (Ack $ ClientAckResponse clientId (_getId frame) frame) responseChan
+    sync $ sendEvt updateChan $ Update (Ack $ ClientAckResponse clientId (read (_getId frame)::Integer) frame) responseChan
     return $ Success Nothing
 
 clientDisconnected :: SubscriptionManager -> ClientId -> IO Response
@@ -165,8 +165,11 @@ handleAckPair context@(AckContext frame msgId clId ackType sentClients) cmd clie
                 Client           -> do { forkIO $ handleNack (elems ackMap) updateChan ; return () }
                 ClientIndividual -> do { forkIO $ handleNack [context] updateChan ; return () }
     case ackType of
-        Client           -> return $ HM.delete clId clientAcks
+        Client           -> return $ HM.insert clId (filterLeqKeys msgId ackMap, filterLeqKeys msgId responseMap) clientAcks
         ClientIndividual -> return $ HM.insert clId (HM.delete msgId ackMap, HM.delete msgId responseMap) clientAcks
+
+filterLeqKeys :: Ord a => a -> HashMap a b -> HashMap a b
+filterLeqKeys n = HM.filterWithKey (\k -> \_ -> k > n)
 
 handleNack :: [AckContext] -> SChan Update -> IO ()
 handleNack contexts updateChan = mapM_ (resendContextFrame updateChan) contexts
@@ -257,7 +260,7 @@ handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId respo
         Just clientSubs -> do
             sync $ sendEvt responseChan (Success Nothing)
             messageId    <- getNewMessageId maybeId inc
-            frame'       <- return $ addFrameHeaderFront (messageIdHeader messageId) frame
+            frame'       <- return $ addFrameHeaderFront (messageIdHeader (show messageId)) frame
             maybeSub     <- sync $ clientChoiceEvt frame' messageId sentClients clientSubs
             case maybeSub of
                 Just clientSub -> do
@@ -275,9 +278,7 @@ handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId respo
 getNewMessageId :: Maybe MessageId -> Incrementer -> IO MessageId
 getNewMessageId maybeId inc = case maybeId of
     Just messageId -> return messageId
-    Nothing        -> do
-        messageId <- getNext inc
-        return $ show $ messageId
+    Nothing        -> getNext inc
 
 clientChoiceEvt :: Frame -> MessageId -> [ClientId] -> HashMap ClientId ClientSub -> Evt (Maybe ClientSub)
 clientChoiceEvt frame messageId sentClients = HM.foldr (partialClientChoiceEvt frame messageId sentClients) 
@@ -293,4 +294,4 @@ transformFrame (Frame _ headers body) messageId (ClientSub _ subId ackType _) =
     let frame = Frame MESSAGE (addHeaderFront (subscriptionHeader subId) headers) body in
         case ackType of 
             Auto -> frame
-            _    -> addFrameHeaderFront (ackHeader messageId) frame
+            _    -> addFrameHeaderFront (ackHeader (show messageId)) frame
