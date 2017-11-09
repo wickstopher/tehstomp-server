@@ -14,7 +14,7 @@ module Subscriptions (
 import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
-import Stomp.Frames hiding (subscribe)
+import Stomp.Frames hiding (subscribe, unsubscribe)
 import Stomp.Frames.IO
 import Stomp.Increment
 

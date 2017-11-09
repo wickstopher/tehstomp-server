@@ -7,7 +7,7 @@ import Network.Socket hiding (close)
 import Prelude hiding (log)
 import System.IO as IO
 import System.Environment
-import Stomp.Frames hiding (subscribe)
+import Stomp.Frames hiding (subscribe, unsubscribe)
 import Stomp.Increment
 import Stomp.TLogger
 import Subscriptions
