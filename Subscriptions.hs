@@ -7,7 +7,9 @@ module Subscriptions (
     unsubscribe,
     subscribe,
     sendAckResponse,
-    sendMessage
+    ackResponseEvt,
+    sendMessage,
+    sendMessageEvt
 ) where
 
 import Control.Concurrent
@@ -92,12 +94,20 @@ unsubscribe (SubscriptionManager updateChan) clientId subId = do
     sync $ sendEvt updateChan $ Remove clientId subId
 
 sendMessage :: SubscriptionManager -> Destination -> Frame -> IO ()
-sendMessage manager@(SubscriptionManager updateChan) destination frame = do
-    sync $ sendEvt updateChan $ GotMessage destination frame
+sendMessage manager destination frame = do
+    sync $ sendMessageEvt manager destination frame
+
+sendMessageEvt :: SubscriptionManager -> Destination -> Frame -> Evt ()
+sendMessageEvt manager@(SubscriptionManager updateChan) destination frame = 
+    sendEvt updateChan $ GotMessage destination frame
 
 sendAckResponse :: SubscriptionManager -> ClientId -> Frame -> IO ()
-sendAckResponse (SubscriptionManager updateChan) clientId frame = do
-    sync $ sendEvt updateChan $ Ack $ ClientAckResponse clientId (read (_getId frame)::Integer) frame
+sendAckResponse manager clientId frame = do
+    sync $ ackResponseEvt manager clientId frame
+
+ackResponseEvt :: SubscriptionManager -> ClientId -> Frame -> Evt ()
+ackResponseEvt (SubscriptionManager updateChan) clientId frame = 
+    sendEvt updateChan $ Ack $ ClientAckResponse clientId (read (_getId frame)::Integer) frame
 
 clientDisconnected :: SubscriptionManager -> ClientId -> IO ()
 clientDisconnected (SubscriptionManager updateChan) clientId = do
