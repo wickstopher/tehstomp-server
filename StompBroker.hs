@@ -179,13 +179,7 @@ handleNextFrame frameHandler console subManager clientId = do
 -- |Notify the SubscriptionManager that a new SEND Frame was received
 handleSendFrame :: Frame -> Logger -> SubscriptionManager -> IO ()
 handleSendFrame frame console subManager = case getDestination frame of
-    Just dest -> do
-        response <- sendMessage subManager dest frame
-        case response of
-            Success response -> case response of
-                Just msg -> log console msg
-                Nothing  -> return ()
-            Error s     -> log console $ "There was an error sending the message: " ++ s
+    Just dest -> sendMessage subManager dest frame
     Nothing   -> throw NoDestinationHeader
 
 -- |Notify the SubscriptionManager that a new SUBSCRIBE Frame was received
@@ -196,7 +190,7 @@ handleSubscriptionRequest handler frame subManager clientId =
         ackType   = selectAckType (getAckType frame)
     in getNewSub maybeDest maybeId ackType handler subManager clientId
 
-handleUnsubscribeRequest:: SubscriptionManager -> ClientId -> Frame -> IO Response
+handleUnsubscribeRequest:: SubscriptionManager -> ClientId -> Frame -> IO ()
 handleUnsubscribeRequest subManager clientId frame = case (getId frame) of 
     Just subId -> unsubscribe subManager clientId subId
     Nothing    -> throw NoIdInUnsubscribe
@@ -206,10 +200,7 @@ getNewSub :: Maybe String -> Maybe String -> AckType -> FrameHandler -> Subscrip
 getNewSub Nothing _ _ _ _ _ = throw NoDestinationHeader
 getNewSub _ Nothing _ _ _ _ = throw NoIdHeader
 getNewSub (Just dest) (Just subId) ackType handler subManager clientId = do
-    response <- subscribe subManager dest clientId subId ackType handler
-    case response of 
-        Success _ -> return ()
-        Error s   -> error s
+    subscribe subManager dest clientId subId ackType handler
 
 selectAckType :: Maybe AckType -> AckType
 selectAckType (Just ackType) = ackType

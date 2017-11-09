@@ -1,7 +1,6 @@
 -- |The Subscriptions module deals with managing subscriptions on the STOMP broker.
 module Subscriptions (
     ClientId,
-    Response(..),
     SubscriptionManager,
     clientDisconnected,
     initManager,
@@ -52,16 +51,12 @@ data ClientAckResponse   = ClientAckResponse ClientId MessageId Frame
 
 data AckUpdate           = Response ClientAckResponse | Context AckContext | ClientDisconnected ClientId
 
-data UpdateType          = Add Destination ClientSub |
+data Update              = Add Destination ClientSub |
                            Remove ClientId SubscriptionId |
                            GotMessage Destination Frame |
                            ResendMessage Destination Frame [ClientId] MessageId |
                            Ack ClientAckResponse |
                            Disconnected ClientId
-
-data Update              = Update UpdateType (SChan Response)
-
-data Response            = Success (Maybe String) | Error String
 
 data SubscriptionManager = SubscriptionManager (SChan Update)
 
@@ -88,35 +83,25 @@ initManager = do
     forkIO $ ackLoop ackChan updateChan HM.empty
     return $ SubscriptionManager updateChan
 
-subscribe :: SubscriptionManager -> Destination -> ClientId -> SubscriptionId -> AckType -> FrameHandler -> IO Response
+subscribe :: SubscriptionManager -> Destination -> ClientId -> SubscriptionId -> AckType -> FrameHandler -> IO ()
 subscribe (SubscriptionManager updateChan) destination clientId subId ackType frameHandler = do
-    responseChan <- sync newSChan
-    sync $ sendEvt updateChan $ Update (Add destination $ ClientSub clientId subId ackType frameHandler) responseChan
-    sync $ recvEvt responseChan
+    sync $ sendEvt updateChan $ Add destination $ ClientSub clientId subId ackType frameHandler
 
-unsubscribe :: SubscriptionManager -> ClientId -> SubscriptionId -> IO Response
+unsubscribe :: SubscriptionManager -> ClientId -> SubscriptionId -> IO ()
 unsubscribe (SubscriptionManager updateChan) clientId subId = do
-    responseChan <- sync newSChan
-    sync $ sendEvt updateChan $ Update (Remove clientId subId) responseChan
-    sync $ recvEvt responseChan
+    sync $ sendEvt updateChan $ Remove clientId subId
 
-sendMessage :: SubscriptionManager -> Destination -> Frame -> IO Response
+sendMessage :: SubscriptionManager -> Destination -> Frame -> IO ()
 sendMessage manager@(SubscriptionManager updateChan) destination frame = do
-    responseChan <- sync newSChan
-    sync $ sendEvt updateChan $ Update (GotMessage destination frame) responseChan
-    sync $ recvEvt responseChan
+    sync $ sendEvt updateChan $ GotMessage destination frame
 
-sendAckResponse :: SubscriptionManager -> ClientId -> Frame -> IO Response
+sendAckResponse :: SubscriptionManager -> ClientId -> Frame -> IO ()
 sendAckResponse (SubscriptionManager updateChan) clientId frame = do
-    responseChan <- sync newSChan
-    sync $ sendEvt updateChan $ Update (Ack $ ClientAckResponse clientId (read (_getId frame)::Integer) frame) responseChan
-    return $ Success Nothing
+    sync $ sendEvt updateChan $ Ack $ ClientAckResponse clientId (read (_getId frame)::Integer) frame
 
-clientDisconnected :: SubscriptionManager -> ClientId -> IO Response
+clientDisconnected :: SubscriptionManager -> ClientId -> IO ()
 clientDisconnected (SubscriptionManager updateChan) clientId = do
-    responseChan <- sync newSChan
-    sync $ sendEvt updateChan $ Update (Disconnected clientId) responseChan
-    return $ Success Nothing
+    sync $ sendEvt updateChan $ Disconnected clientId
 
 ackLoop :: SChan AckUpdate -> SChan Update -> ClientAcks -> IO ()
 ackLoop ackChan updateChan clientAcks = do
@@ -177,14 +162,14 @@ handleNack contexts updateChan = mapM_ (resendContextFrame updateChan) contexts
 resendContextFrame :: SChan Update -> AckContext -> IO ()
 resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
     responseChan <- sync newSChan
-    forkIO $ sync $ sendEvt updateChan (Update (ResendMessage (_getDestination frame) frame sentClients msgId) responseChan)
+    forkIO $ sync $ sendEvt updateChan $ ResendMessage (_getDestination frame) frame sentClients msgId
     sync $ recvEvt responseChan
     return ()
 
 resendTimedOutFrame :: Frame -> SChan Update -> Destination -> [ClientId] -> MessageId -> IO ()
 resendTimedOutFrame frame updateChan dest sentClients messageId = do
     responseChan <- sync newSChan
-    forkIO $ sync $ sendEvt updateChan (Update (ResendMessage dest frame sentClients messageId) responseChan)
+    forkIO $ sync $ sendEvt updateChan $ ResendMessage dest frame sentClients messageId
     sync $ recvEvt responseChan
     return ()
 
@@ -196,27 +181,25 @@ updateLoop updateChan ackChan subs inc = do
 
 handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan AckUpdate -> Incrementer -> IO Subscriptions
 -- Add
-handleUpdate (Update (Add dest clientSub) rChan) subscriptions _ _ _ = do
-    forkIO $ sync $ sendEvt rChan (Success Nothing)
+handleUpdate (Add dest clientSub) subscriptions _ _ _ = do
     return $ addSubscription dest clientSub subscriptions
 -- Remove
-handleUpdate (Update (Remove clientId subId) rChan) subs _ _ _ = do
-    forkIO $ sync $ sendEvt rChan (Success Nothing)
+handleUpdate (Remove clientId subId) subs _ _ _ = do
     return $ removeSubscription clientId subId subs
 -- GotMessage
-handleUpdate (Update (GotMessage dest frame) rChan) subs updateChan ackChan inc = do
-    forkIO $ handleMessage frame dest subs [] Nothing rChan ackChan updateChan inc
+handleUpdate (GotMessage dest frame) subs updateChan ackChan inc = do
+    forkIO $ handleMessage frame dest subs [] Nothing ackChan updateChan inc
     return subs
 -- Resend message due to NACK response
-handleUpdate (Update (ResendMessage dest frame sentClients messageId) rChan) subs updateChan ackChan inc = do
-    forkIO $ handleMessage frame dest subs sentClients (Just messageId) rChan ackChan updateChan inc
+handleUpdate (ResendMessage dest frame sentClients messageId) subs updateChan ackChan inc = do
+    forkIO $ handleMessage frame dest subs sentClients (Just messageId) ackChan updateChan inc
     return subs
 -- Ack response from client
-handleUpdate (Update (Ack clientResponse) rChan) subs _ ackChan _ = do
+handleUpdate (Ack clientResponse) subs _ ackChan _ = do
     forkIO $ sync $ sendEvt ackChan (Response clientResponse)
     return subs
 -- Client disconnected
-handleUpdate (Update (Disconnected clientId) rChan) subs@(Subscriptions subMap clientDests) _ ackChan _ = do
+handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests) _ ackChan _ = do
     forkIO $ sync $ sendEvt ackChan (ClientDisconnected clientId)
     return $ removeAllClientSubs subs clientId
 
@@ -254,11 +237,10 @@ removeSubscription clientId subId subs@(Subscriptions subMap clientDests) =
                 Nothing          -> Subscriptions subMap clientDests'
         Nothing -> subs
 
-handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan Response -> SChan AckUpdate -> SChan Update -> Incrementer -> IO ()
-handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId responseChan ackChan updateChan inc =
+handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan AckUpdate -> SChan Update -> Incrementer -> IO ()
+handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId ackChan updateChan inc =
     case HM.lookup dest subMap of
         Just clientSubs -> do
-            sync $ sendEvt responseChan (Success Nothing)
             messageId    <- getNewMessageId maybeId inc
             frame'       <- return $ addFrameHeaderFront (messageIdHeader (show messageId)) frame
             maybeSub     <- sync $ clientChoiceEvt frame' messageId sentClients clientSubs
@@ -271,9 +253,8 @@ handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId respo
                         _    -> do
                             forkIO $ sync $ sendEvt ackChan (Context context)
                             return ()
-                    sync $ sendEvt responseChan $ Success Nothing
                 Nothing -> do { forkIO $ resendTimedOutFrame frame updateChan dest sentClients messageId ; return () }
-        Nothing -> sync $ sendEvt responseChan (Error "No subscribers")
+        Nothing -> return ()
 
 getNewMessageId :: Maybe MessageId -> Incrementer -> IO MessageId
 getNewMessageId maybeId inc = case maybeId of
