@@ -11,6 +11,7 @@ import Stomp.Frames hiding (subscribe, unsubscribe)
 import Stomp.Increment
 import Stomp.TLogger
 import Subscriptions
+import Transaction
 
 data ClientException = NoIdHeader |
                        NoDestinationHeader  |

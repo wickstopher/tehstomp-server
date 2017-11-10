@@ -1,6 +1,7 @@
 -- |The Subscriptions module deals with managing subscriptions on the STOMP broker.
 module Subscriptions (
     ClientId,
+    Destination,
     SubscriptionManager,
     clientDisconnected,
     initManager,
