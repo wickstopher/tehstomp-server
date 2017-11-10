@@ -18,6 +18,8 @@ data ClientException = NoIdHeader |
                        SubscriptionUpdate |
                        NoIdInUnsubscribe
 
+data Connection      = Connection ClientId FrameHandler ClientTransactionManager
+
 instance Exception ClientException
 instance Show ClientException where
     show NoIdHeader          = "No id header present in request"
@@ -85,10 +87,11 @@ handleNewConnection frameHandler frame console subManager inc = let version = de
     case version of
         Just v  -> do 
             sendConnectedResponse frameHandler v
-            clientId <- getNext inc
+            clientId           <- getNext inc
+            transactionManager <- initTransactionManager subManager
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
             log console $ "Client unique ID is " ++ (show clientId)
-            connectionLoop frameHandler console subManager clientId
+            connectionLoop console subManager (Connection clientId frameHandler transactionManager)
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection console frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
@@ -121,9 +124,9 @@ getHighestSupportedVersion clientVersions =
         maybeMax mutualVersions
 
 -- |Loop, receiving and processing new Frames from the client.
-connectionLoop :: FrameHandler -> Logger -> SubscriptionManager -> ClientId -> IO ()
-connectionLoop frameHandler console subManager clientId = do
-    result <- try (handleNextFrame frameHandler console subManager clientId) 
+connectionLoop :: Logger -> SubscriptionManager -> Connection -> IO ()
+connectionLoop console subManager connection@(Connection clientId frameHandler _) = do
+    result <- try (handleNextFrame console subManager connection) 
         :: IO (Either SomeException (Maybe Command))
     case result of
         Left exception -> do
@@ -131,15 +134,15 @@ connectionLoop frameHandler console subManager clientId = do
             rejectConnection console frameHandler ("Error: " ++ (show exception))
         Right command -> case command of
             Just DISCONNECT -> return ()
-            Just _          -> connectionLoop frameHandler console subManager clientId
+            Just _          -> connectionLoop console subManager connection
             Nothing         -> do
                 close frameHandler
                 clientDisconnected subManager clientId
                 return ()
 
 -- |This function blocks until a Frame is received from the client, and then processes that Frame appropriately.
-handleNextFrame :: FrameHandler -> Logger -> SubscriptionManager -> ClientId -> IO (Maybe Command)
-handleNextFrame frameHandler console subManager clientId = do 
+handleNextFrame :: Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
+handleNextFrame console subManager (Connection clientId frameHandler transactionManager) = do 
     f <- get frameHandler
     case f of 
         NewFrame frame -> do
