@@ -115,9 +115,14 @@ clientDisconnected (SubscriptionManager updateChan) clientId = do
     sync $ sendEvt updateChan $ Disconnected clientId
 
 ackLoop :: SChan AckUpdate -> SChan Update -> ClientAcks -> IO ()
-ackLoop ackChan updateChan clientAcks = do
-    clientAcks' <- sync $ (recvEvt ackChan) `thenEvt` (\update -> handleAck update clientAcks updateChan)
-    ackLoop ackChan updateChan clientAcks'
+ackLoop ackChan updateChan clientAcks = 
+    let evtLoop c = do
+        update      <- recvEvt ackChan
+        clientAcks' <- handleAck update c updateChan
+        (alwaysEvt clientAcks') `chooseEvt` (evtLoop clientAcks')
+    in do
+        clientAcks'' <- sync $ evtLoop clientAcks
+        ackLoop ackChan updateChan clientAcks''
 
 handleAck :: AckUpdate -> ClientAcks -> SChan Update -> Evt ClientAcks
 handleAck ackUpdate clientAcks updateChan = case ackUpdate of
@@ -185,9 +190,14 @@ resendTimedOutFrame frame updateChan dest sentClients messageId = do
     return ()
 
 updateLoop :: SChan Update -> SChan AckUpdate -> Subscriptions -> Incrementer -> IO ()
-updateLoop updateChan ackChan subs inc = do
-    subs' <- sync $ (recvEvt updateChan) `thenEvt` (\update -> handleUpdate update subs updateChan ackChan inc)
-    updateLoop updateChan ackChan subs' inc
+updateLoop updateChan ackChan subs inc = 
+    let evtLoop s = do
+        update <- recvEvt updateChan
+        subs' <- handleUpdate update s updateChan ackChan inc
+        (alwaysEvt subs') `chooseEvt` (evtLoop subs')
+    in do
+        subs'' <- sync $ evtLoop subs
+        updateLoop updateChan ackChan subs'' inc
 
 handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan AckUpdate -> Incrementer -> Evt Subscriptions
 -- Add
