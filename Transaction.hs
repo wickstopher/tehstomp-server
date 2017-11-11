@@ -1,17 +1,20 @@
 module Transaction (
     ClientTransactionManager,
+    UpdateResponse(..),
+    TransactionId,
     initTransactionManager,
     begin,
     commit,
     abort,
     ackResponse,
-    send
+    send,
+    disconnect
 ) where
 
 import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
-import Stomp.Frames
+import Stomp.Frames hiding (disconnect)
 import Subscriptions
 
 type TransactionMap = HashMap String Transaction
@@ -22,7 +25,8 @@ data TransactionUpdate  = Begin TransactionId |
                          Commit TransactionId | 
                          Abort TransactionId | 
                          AckResponse TransactionId ClientId Frame |
-                         Send TransactionId Destination Frame
+                         Send TransactionId Destination Frame |
+                         ClientDisconnect
 
 data UpdateResponse           = Success | Error String
 
@@ -51,6 +55,9 @@ ackResponse transactionId clientId frame manager = sendUpdate (AckResponse trans
 send :: TransactionId -> Destination -> Frame -> ClientTransactionManager -> IO UpdateResponse
 send transactionId dest frame manager = sendUpdate (Send transactionId dest frame) manager
 
+disconnect :: ClientTransactionManager -> IO UpdateResponse
+disconnect manager = sendUpdate ClientDisconnect manager
+
 sendUpdate :: TransactionUpdate -> ClientTransactionManager -> IO UpdateResponse
 sendUpdate update (Manager updateChan responseChan) =
     let event = do
@@ -59,33 +66,40 @@ sendUpdate update (Manager updateChan responseChan) =
     in sync event
 
 transactionLoop :: TransactionMap -> SChan TransactionUpdate -> SChan UpdateResponse -> SubscriptionManager -> IO ()
-transactionLoop tMap updateChan responseChan subManager = do
-    tMap' <- sync $ updateEvt tMap updateChan responseChan subManager
-    transactionLoop tMap' updateChan responseChan subManager
+transactionLoop tmap updateChan responseChan subManager = do
+    mapUpdate <- sync $ updateEvt tmap updateChan responseChan subManager
+    case mapUpdate of
+        Just tmap' -> transactionLoop tmap' updateChan responseChan subManager
+        Nothing    -> return ()
 
-updateEvt :: TransactionMap -> SChan TransactionUpdate -> SChan UpdateResponse -> SubscriptionManager -> Evt TransactionMap
+updateEvt :: TransactionMap -> SChan TransactionUpdate -> SChan UpdateResponse -> SubscriptionManager -> Evt (Maybe TransactionMap)
 updateEvt transactionMap transactionChan responseChan subManager = do
     update            <- recvEvt transactionChan
-    (tmap', response) <- handleUpdate update transactionMap subManager
-    sendEvt responseChan response
-    alwaysEvt tmap'
+    case update of
+        ClientDisconnect -> do
+            sendEvt responseChan Success
+            alwaysEvt Nothing
+        _                -> do 
+            (tmap', response) <- handleUpdate update transactionMap subManager
+            sendEvt responseChan response
+            alwaysEvt $ Just tmap'
 
 handleUpdate :: TransactionUpdate -> TransactionMap -> SubscriptionManager -> Evt (TransactionMap, UpdateResponse)
-handleUpdate update tMap subManager = case update of
-    Begin transactionId  -> case HM.lookup transactionId tMap of
-        Nothing -> alwaysEvt (HM.insert transactionId (alwaysEvt ()) tMap, Success)
-        _       -> alwaysEvt (tMap, Error $ "Attempt to begin an existing transaction: " ++ transactionId)
-    Commit transactionId -> case HM.lookup transactionId tMap of
-        Just transaction -> transaction `thenEvt` (\_ -> alwaysEvt ((HM.delete transactionId tMap), Success))
-        Nothing          -> alwaysEvt (tMap, Error $ "Attempt to commit a non-existent transaction: " ++ transactionId)
-    Abort transactionId        -> alwaysEvt (HM.delete transactionId tMap, Success)
-    AckResponse transactionId clientId frame -> case HM.lookup transactionId tMap of 
+handleUpdate update tmap subManager = case update of
+    Begin transactionId  -> case HM.lookup transactionId tmap of
+        Nothing -> alwaysEvt (HM.insert transactionId (alwaysEvt ()) tmap, Success)
+        _       -> alwaysEvt (tmap, Error $ "Attempt to begin an existing transaction: " ++ transactionId)
+    Commit transactionId -> case HM.lookup transactionId tmap of
+        Just transaction -> transaction `thenEvt` (\_ -> alwaysEvt ((HM.delete transactionId tmap), Success))
+        Nothing          -> alwaysEvt (tmap, Error $ "Attempt to commit a non-existent transaction: " ++ transactionId)
+    Abort transactionId        -> alwaysEvt (HM.delete transactionId tmap, Success)
+    AckResponse transactionId clientId frame -> case HM.lookup transactionId tmap of 
         Just transaction -> 
-            alwaysEvt (HM.insert transactionId (transaction `thenEvt` (\_ -> ackResponseEvt subManager clientId frame)) tMap, Success)
+            alwaysEvt (HM.insert transactionId (transaction `thenEvt` (\_ -> ackResponseEvt subManager clientId frame)) tmap, Success)
         Nothing          -> 
-            alwaysEvt (tMap, Error $ "Attempt to add to a non-existent transaction: " ++ transactionId)
-    Send transactionId dest frame     -> case HM.lookup transactionId tMap of
+            alwaysEvt (tmap, Error $ "Attempt to add to a non-existent transaction: " ++ transactionId)
+    Send transactionId dest frame     -> case HM.lookup transactionId tmap of
         Just transaction -> 
-            alwaysEvt (HM.insert transactionId (transaction `thenEvt` (\_ -> sendMessageEvt subManager dest frame)) tMap, Success)
+            alwaysEvt (HM.insert transactionId (transaction `thenEvt` (\_ -> sendMessageEvt subManager dest frame)) tmap, Success)
         Nothing ->
-            alwaysEvt (tMap, Error $ "Attempt to add to a non-existent transaction: " ++ transactionId)
+            alwaysEvt (tmap, Error $ "Attempt to add to a non-existent transaction: " ++ transactionId)

@@ -16,16 +16,20 @@ import Transaction
 data ClientException = NoIdHeader |
                        NoDestinationHeader  |
                        SubscriptionUpdate |
-                       NoIdInUnsubscribe
+                       NoIdInUnsubscribe | 
+                       InvalidTransactionHeader Command |
+                       TransactionException String
 
 data Connection      = Connection ClientId FrameHandler ClientTransactionManager
 
 instance Exception ClientException
 instance Show ClientException where
-    show NoIdHeader          = "No id header present in request"
-    show NoDestinationHeader = "No destination header present in request"
-    show SubscriptionUpdate  = "There was an error processing the subscription request"
-    show NoIdInUnsubscribe   = "No subscription ID header present in unsubscribe request"
+    show NoIdHeader                   = "No id header present in request"
+    show NoDestinationHeader          = "No destination header present in request"
+    show SubscriptionUpdate           = "There was an error processing the subscription request"
+    show NoIdInUnsubscribe            = "No subscription ID header present in unsubscribe request"
+    show (InvalidTransactionHeader c) = "Invalid transaction header in " ++ (show c) ++ " frame"
+    show (TransactionException s)     = "Error occurred while processing transaction: " ++ s
 
 -- |Set up the environment and initialize the socket loop.
 main :: IO ()
@@ -136,49 +140,78 @@ connectionLoop console subManager connection@(Connection clientId frameHandler _
             Just DISCONNECT -> return ()
             Just _          -> connectionLoop console subManager connection
             Nothing         -> do
-                close frameHandler
-                clientDisconnected subManager clientId
+                disconnectClient connection subManager
                 return ()
+
+disconnectClient :: Connection -> SubscriptionManager -> IO UpdateResponse
+disconnectClient (Connection clientId frameHandler transactionManager) subManager = do
+    close frameHandler
+    clientDisconnected subManager clientId
+    Transaction.disconnect transactionManager
 
 -- |This function blocks until a Frame is received from the client, and then processes that Frame appropriately.
 handleNextFrame :: Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
-handleNextFrame console subManager (Connection clientId frameHandler transactionManager) = do 
+handleNextFrame console subManager connection@(Connection _ frameHandler _) = do 
     f <- get frameHandler
     case f of 
-        NewFrame frame -> do
-            command <- return $ getCommand frame
-            log console $ "Received " ++ (show command) ++ " frame"
-            handleReceiptRequest frameHandler frame console
-            case command of
-                DISCONNECT  -> do 
-                    log console "Disconnect request received; closing connection to client"
-                    close frameHandler
-                    clientDisconnected subManager clientId
-                    return $ Just command
-                SEND        -> do 
-                    handleSendFrame frame console subManager
-                    return $ Just command
-                SUBSCRIBE   -> do
-                    handleSubscriptionRequest frameHandler frame subManager clientId
-                    return $ Just command
-                UNSUBSCRIBE -> do
-                    handleUnsubscribeRequest subManager clientId frame
-                    return $ Just command
-                ACK         -> do
-                    sendAckResponse subManager clientId frame
-                    return $ Just command
-                NACK        -> do
-                    sendAckResponse subManager clientId frame
-                    return $ Just command
-                _           -> do
-                    log console "Handler not yet implemented"
-                    return $ Just command
+        NewFrame frame -> case (getTransaction frame) of
+            Just txid -> handleTransactionFrame frame txid console connection
+            Nothing -> handleSingleFrame frame console subManager connection
         GotEof         -> do
             log console "Client disconnected without sending a frame."
             return Nothing
         ParseError msg -> do
             log console $ "There was an error parsing a client frame: " ++ (show msg)
             return Nothing
+
+handleSingleFrame :: Frame -> Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
+handleSingleFrame frame console subManager connection@(Connection clientId frameHandler _) = do
+    command <- return $ getCommand frame
+    log console $ "Received " ++ (show command) ++ " frame"
+    handleReceiptRequest frameHandler frame console
+    case command of
+        DISCONNECT  -> do 
+            log console "Disconnect request received; closing connection to client"
+            disconnectClient connection subManager
+            return $ Just command
+        SEND        -> do 
+            handleSendFrame frame console subManager
+            return $ Just command
+        SUBSCRIBE   -> do
+            handleSubscriptionRequest frameHandler frame subManager clientId
+            return $ Just command
+        UNSUBSCRIBE -> do
+            handleUnsubscribeRequest subManager clientId frame
+            return $ Just command
+        ACK         -> do
+            sendAckResponse subManager clientId frame
+            return $ Just command
+        NACK        -> do
+            sendAckResponse subManager clientId frame
+            return $ Just command
+        _           -> do
+            log console "Handler not yet implemented"
+            return $ Just command
+
+handleTransactionFrame :: Frame -> TransactionId -> Logger -> Connection -> IO (Maybe Command)
+handleTransactionFrame frame txid console connection@(Connection clientId _ transactionManager) =
+    let 
+        command = getCommand frame
+        execute = case command of
+            BEGIN  -> begin txid transactionManager
+            COMMIT -> commit txid transactionManager
+            ABORT  -> abort txid transactionManager
+            SEND   -> case getDestination frame of
+                Just dest -> Transaction.send txid dest frame transactionManager
+                Nothing   -> throw NoDestinationHeader
+            ACK    -> ackResponse txid clientId frame transactionManager
+            NACK   -> ackResponse txid clientId frame transactionManager
+            _      -> throw $ InvalidTransactionHeader command
+    in do
+        response <- execute
+        case response of
+            Success -> return $ Just command
+            Error s -> throw $ TransactionException s
 
 -- |Notify the SubscriptionManager that a new SEND Frame was received
 handleSendFrame :: Frame -> Logger -> SubscriptionManager -> IO ()
