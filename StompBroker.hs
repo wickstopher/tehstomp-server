@@ -7,7 +7,7 @@ import Network.Socket hiding (close)
 import Prelude hiding (log)
 import System.IO as IO
 import System.Environment
-import Stomp.Frames hiding (subscribe, unsubscribe)
+import Stomp.Frames hiding (subscribe, unsubscribe, begin, commit, abort)
 import Stomp.Increment
 import Stomp.TLogger
 import Subscriptions
@@ -154,9 +154,13 @@ handleNextFrame :: Logger -> SubscriptionManager -> Connection -> IO (Maybe Comm
 handleNextFrame console subManager connection@(Connection _ frameHandler _) = do 
     f <- get frameHandler
     case f of 
-        NewFrame frame -> case (getTransaction frame) of
-            Just txid -> handleTransactionFrame frame txid console connection
-            Nothing -> handleSingleFrame frame console subManager connection
+        NewFrame frame -> do
+            command <- return $ getCommand frame
+            log console $ "Received " ++ (show command) ++ " frame"
+            handleReceiptRequest frameHandler frame console
+            case (getTransaction frame) of
+                Just txid -> handleTransactionFrame command frame txid console connection
+                Nothing -> handleSingleFrame command frame console subManager connection
         GotEof         -> do
             log console "Client disconnected without sending a frame."
             return Nothing
@@ -164,11 +168,8 @@ handleNextFrame console subManager connection@(Connection _ frameHandler _) = do
             log console $ "There was an error parsing a client frame: " ++ (show msg)
             return Nothing
 
-handleSingleFrame :: Frame -> Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
-handleSingleFrame frame console subManager connection@(Connection clientId frameHandler _) = do
-    command <- return $ getCommand frame
-    log console $ "Received " ++ (show command) ++ " frame"
-    handleReceiptRequest frameHandler frame console
+handleSingleFrame :: Command -> Frame -> Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
+handleSingleFrame command frame console subManager connection@(Connection clientId frameHandler _) =
     case command of
         DISCONNECT  -> do 
             log console "Disconnect request received; closing connection to client"
@@ -193,10 +194,9 @@ handleSingleFrame frame console subManager connection@(Connection clientId frame
             log console "Handler not yet implemented"
             return $ Just command
 
-handleTransactionFrame :: Frame -> TransactionId -> Logger -> Connection -> IO (Maybe Command)
-handleTransactionFrame frame txid console connection@(Connection clientId _ transactionManager) =
+handleTransactionFrame :: Command -> Frame -> TransactionId -> Logger -> Connection -> IO (Maybe Command)
+handleTransactionFrame command frame txid console connection@(Connection clientId _ transactionManager) =
     let 
-        command = getCommand frame
         execute = case command of
             BEGIN  -> begin txid transactionManager
             COMMIT -> commit txid transactionManager
@@ -208,6 +208,7 @@ handleTransactionFrame frame txid console connection@(Connection clientId _ tran
             NACK   -> ackResponse txid clientId frame transactionManager
             _      -> throw $ InvalidTransactionHeader command
     in do
+        log console ("Adding frame to transaction " ++ txid)
         response <- execute
         case response of
             Success -> return $ Just command

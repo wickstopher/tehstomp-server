@@ -14,7 +14,7 @@ module Transaction (
 import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
-import Stomp.Frames hiding (disconnect)
+import Stomp.Frames hiding (disconnect, commit, begin, abort)
 import Subscriptions
 
 type TransactionMap = HashMap String Transaction
