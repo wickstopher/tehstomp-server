@@ -1,4 +1,5 @@
 import Control.Concurrent
+import Control.Concurrent.TxEvent
 import Control.Exception
 import Data.ByteString as BS
 import Data.List as List
@@ -20,7 +21,7 @@ data ClientException = NoIdHeader |
                        InvalidTransactionHeader Command |
                        TransactionException String
 
-data Connection      = Connection ClientId FrameHandler ClientTransactionManager
+data Connection      = Connection ClientId FrameHandler ClientTransactionManager Int Int
 
 instance Exception ClientException
 instance Show ClientException where
@@ -66,8 +67,8 @@ socketLoop sock console subManager inc = do
 -- |Negotiate client connection. 
 negotiateConnection :: FrameHandler -> Logger -> SubscriptionManager -> Incrementer -> IO ()
 negotiateConnection frameHandler console subManager inc = do
-    f <- get frameHandler
-    case f of 
+    frameEvt <- get frameHandler
+    case frameEvt of 
         NewFrame frame -> case (getCommand frame) of
             STOMP   -> do
                 log console "STOMP frame received; negotiating new connection"
@@ -90,20 +91,28 @@ handleNewConnection :: FrameHandler -> Frame -> Logger -> SubscriptionManager ->
 handleNewConnection frameHandler frame console subManager inc = let version = determineVersion frame in
     case version of
         Just v  -> do 
-            sendConnectedResponse frameHandler v
-            clientId           <- getNext inc
-            transactionManager <- initTransactionManager subManager
+            (clientSend, serverSend) <- return $ determineHeartbeats frame              
+            sendConnectedResponse frameHandler v clientSend serverSend
+            clientId                 <- getNext inc
+            transactionManager       <- initTransactionManager subManager
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
             log console $ "Client unique ID is " ++ (show clientId)
-            connectionLoop console subManager (Connection clientId frameHandler transactionManager)
+            connectionLoop console subManager (Connection clientId frameHandler transactionManager clientSend serverSend)
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection console frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
 
+determineHeartbeats :: Frame -> (Int, Int)
+determineHeartbeats frame = 
+    let (x, y) = getHeartbeat frame in
+        (if x == 0 then 0 else max x 15000, 
+            if y == 0 then 0 else max y 15000)
+
 -- |Helper function for handleNewConnection; sends the CONNECTED Frame
-sendConnectedResponse :: FrameHandler -> String -> IO ()
-sendConnectedResponse frameHandler version = let response = connected version in
-    do put frameHandler response
+sendConnectedResponse :: FrameHandler -> String -> Int -> Int -> IO ()
+sendConnectedResponse frameHandler version clientSend serverSend = 
+    let response = connected version serverSend clientSend in
+        put frameHandler response
 
 -- |Reject the Connection and close the handle.
 rejectConnection :: Logger -> FrameHandler -> String -> IO ()
@@ -129,7 +138,7 @@ getHighestSupportedVersion clientVersions =
 
 -- |Loop, receiving and processing new Frames from the client.
 connectionLoop :: Logger -> SubscriptionManager -> Connection -> IO ()
-connectionLoop console subManager connection@(Connection clientId frameHandler _) = do
+connectionLoop console subManager connection@(Connection clientId frameHandler _ _ _) = do
     result <- try (handleNextFrame console subManager connection) 
         :: IO (Either SomeException (Maybe Command))
     case result of
@@ -144,16 +153,16 @@ connectionLoop console subManager connection@(Connection clientId frameHandler _
                 return ()
 
 disconnectClient :: Connection -> SubscriptionManager -> IO UpdateResponse
-disconnectClient (Connection clientId frameHandler transactionManager) subManager = do
+disconnectClient (Connection clientId frameHandler transactionManager _ _) subManager = do
     close frameHandler
     clientDisconnected subManager clientId
     Transaction.disconnect transactionManager
 
 -- |This function blocks until a Frame is received from the client, and then processes that Frame appropriately.
 handleNextFrame :: Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
-handleNextFrame console subManager connection@(Connection _ frameHandler _) = do 
-    f <- get frameHandler
-    case f of 
+handleNextFrame console subManager connection@(Connection _ frameHandler _ _ _) = do 
+    frameEvt <- sync $ getEvt frameHandler 
+    case frameEvt of 
         NewFrame frame -> do
             command <- return $ getCommand frame
             log console $ "Received " ++ (show command) ++ " frame"
@@ -161,6 +170,9 @@ handleNextFrame console subManager connection@(Connection _ frameHandler _) = do
             case (getTransaction frame) of
                 Just txid -> handleTransactionFrame command frame txid console connection
                 Nothing -> handleSingleFrame command frame console subManager connection
+        Heartbeat      -> do
+            log console "Got a heartbeat from the client"
+            return $ Just SEND
         GotEof         -> do
             log console "Client disconnected without sending a frame."
             return Nothing
@@ -169,7 +181,7 @@ handleNextFrame console subManager connection@(Connection _ frameHandler _) = do
             return Nothing
 
 handleSingleFrame :: Command -> Frame -> Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
-handleSingleFrame command frame console subManager connection@(Connection clientId frameHandler _) =
+handleSingleFrame command frame console subManager connection@(Connection clientId frameHandler _ _ _) =
     case command of
         DISCONNECT  -> do 
             log console "Disconnect request received; closing connection to client"
@@ -195,7 +207,7 @@ handleSingleFrame command frame console subManager connection@(Connection client
             return $ Just command
 
 handleTransactionFrame :: Command -> Frame -> TransactionId -> Logger -> Connection -> IO (Maybe Command)
-handleTransactionFrame command frame txid console connection@(Connection clientId _ transactionManager) =
+handleTransactionFrame command frame txid console connection@(Connection clientId _ transactionManager _ _) =
     let 
         execute = case command of
             BEGIN  -> begin txid transactionManager
