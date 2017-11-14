@@ -21,7 +21,7 @@ data ClientException = NoIdHeader |
                        InvalidTransactionHeader Command |
                        TransactionException String
 
-data Connection      = Connection ClientId FrameHandler ClientTransactionManager Int Int
+data Connection      = Connection ClientId FrameHandler ClientTransactionManager Int
 
 instance Exception ClientException
 instance Show ClientException where
@@ -91,13 +91,19 @@ handleNewConnection :: FrameHandler -> Frame -> Logger -> SubscriptionManager ->
 handleNewConnection frameHandler frame console subManager inc = let version = determineVersion frame in
     case version of
         Just v  -> do 
-            (clientSend, serverSend) <- return $ determineHeartbeats frame              
+            (clientSend, serverSend) <- return $ determineHeartbeats frame    
+            log console $ "Heartbeat negotations are (" ++ (show clientSend) ++ "," ++ (show serverSend) ++ ")"        
             sendConnectedResponse frameHandler v clientSend serverSend
+            updateHeartbeat frameHandler (1000 * serverSend) -- convert milliseconds to microseconds
             clientId                 <- getNext inc
             transactionManager       <- initTransactionManager subManager
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
             log console $ "Client unique ID is " ++ (show clientId)
-            connectionLoop console subManager (Connection clientId frameHandler transactionManager clientSend serverSend)
+            connectionLoop console subManager $ Connection 
+                clientId 
+                frameHandler 
+                transactionManager 
+                (if clientSend == 0 then 0 else 1000 * (clientSend + 2000)) -- Give 2 seconds of leeway, convert milliseconds to microseconds
         Nothing -> do
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection console frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
@@ -105,8 +111,8 @@ handleNewConnection frameHandler frame console subManager inc = let version = de
 determineHeartbeats :: Frame -> (Int, Int)
 determineHeartbeats frame = 
     let (x, y) = getHeartbeat frame in
-        (if x == 0 then 0 else max x 15000, 
-            if y == 0 then 0 else max y 15000)
+        (if x == 0 then 0 else max x 2000, 
+            if y == 0 then 0 else max y 2000)
 
 -- |Helper function for handleNewConnection; sends the CONNECTED Frame
 sendConnectedResponse :: FrameHandler -> String -> Int -> Int -> IO ()
@@ -138,7 +144,7 @@ getHighestSupportedVersion clientVersions =
 
 -- |Loop, receiving and processing new Frames from the client.
 connectionLoop :: Logger -> SubscriptionManager -> Connection -> IO ()
-connectionLoop console subManager connection@(Connection clientId frameHandler _ _ _) = do
+connectionLoop console subManager connection@(Connection clientId frameHandler _ _) = do
     result <- try (handleNextFrame console subManager connection) 
         :: IO (Either SomeException (Maybe Command))
     case result of
@@ -153,15 +159,15 @@ connectionLoop console subManager connection@(Connection clientId frameHandler _
                 return ()
 
 disconnectClient :: Connection -> SubscriptionManager -> IO UpdateResponse
-disconnectClient (Connection clientId frameHandler transactionManager _ _) subManager = do
+disconnectClient (Connection clientId frameHandler transactionManager _) subManager = do
     close frameHandler
     clientDisconnected subManager clientId
     Transaction.disconnect transactionManager
 
 -- |This function blocks until a Frame is received from the client, and then processes that Frame appropriately.
 handleNextFrame :: Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
-handleNextFrame console subManager connection@(Connection _ frameHandler _ _ _) = do 
-    frameEvt <- sync $ getEvt frameHandler 
+handleNextFrame console subManager connection@(Connection _ frameHandler _ clientSend) = do 
+    frameEvt <- sync $ getEvtWithTimeOut frameHandler clientSend
     case frameEvt of 
         NewFrame frame -> do
             command <- return $ getCommand frame
@@ -170,9 +176,10 @@ handleNextFrame console subManager connection@(Connection _ frameHandler _ _ _) 
             case (getTransaction frame) of
                 Just txid -> handleTransactionFrame command frame txid console connection
                 Nothing -> handleSingleFrame command frame console subManager connection
-        Heartbeat      -> do
-            log console "Got a heartbeat from the client"
-            return $ Just SEND
+        Heartbeat      -> return $ Just SEND
+        TimedOut       -> do
+            log console "Timed out waiting for a heartbeat from the client"
+            return Nothing
         GotEof         -> do
             log console "Client disconnected without sending a frame."
             return Nothing
@@ -181,7 +188,7 @@ handleNextFrame console subManager connection@(Connection _ frameHandler _ _ _) 
             return Nothing
 
 handleSingleFrame :: Command -> Frame -> Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
-handleSingleFrame command frame console subManager connection@(Connection clientId frameHandler _ _ _) =
+handleSingleFrame command frame console subManager connection@(Connection clientId frameHandler _ _ ) =
     case command of
         DISCONNECT  -> do 
             log console "Disconnect request received; closing connection to client"
@@ -207,7 +214,7 @@ handleSingleFrame command frame console subManager connection@(Connection client
             return $ Just command
 
 handleTransactionFrame :: Command -> Frame -> TransactionId -> Logger -> Connection -> IO (Maybe Command)
-handleTransactionFrame command frame txid console connection@(Connection clientId _ transactionManager _ _) =
+handleTransactionFrame command frame txid console connection@(Connection clientId _ transactionManager _) =
     let 
         execute = case command of
             BEGIN  -> begin txid transactionManager
