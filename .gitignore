@@ -1,4 +1,5 @@
 StompBroker
 *.o
 *.hi
+dist/
 

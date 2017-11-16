@@ -1,4 +1,4 @@
-module Transaction (
+module Stomp.Transaction (
     ClientTransactionManager,
     UpdateResponse(..),
     TransactionId,
@@ -15,7 +15,7 @@ import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
 import Stomp.Frames hiding (disconnect, commit, begin, abort)
-import Subscriptions
+import Stomp.Subscriptions
 
 type TransactionMap = HashMap String Transaction
 type TransactionId  = String
@@ -61,8 +61,8 @@ disconnect manager = sendUpdate ClientDisconnect manager
 sendUpdate :: TransactionUpdate -> ClientTransactionManager -> IO UpdateResponse
 sendUpdate update (Manager updateChan responseChan) =
     let event = do
-        sendEvt updateChan update
-        recvEvt responseChan
+            sendEvt updateChan update
+            recvEvt responseChan
     in sync event
 
 transactionLoop :: TransactionMap -> SChan TransactionUpdate -> SChan UpdateResponse -> SubscriptionManager -> IO ()
