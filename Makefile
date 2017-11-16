@@ -1,15 +1,15 @@
 build:
-	cabal build
 	ghc StompBroker
 
 docs:
+	cabal configure
 	cabal haddock
 
-install: build docs
+install: docs
 	cabal install --enable-documentation
 
 clean:
-	rm StompBroker *.o *.hi Stomp/*.o Stomp/*.hi
+	rm -f StompBroker *.o *.hi Stomp/*.o Stomp/*.hi
 	rm -rf dist/
 
 uninstall: clean

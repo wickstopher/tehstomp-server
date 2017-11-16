@@ -14,6 +14,7 @@ import Stomp.TLogger
 import Stomp.Subscriptions
 import Stomp.Transaction as Transaction
 
+-- |ClientExceptions are thrown during frame processing
 data ClientException = NoIdHeader |
                        NoDestinationHeader  |
                        SubscriptionUpdate |
@@ -21,6 +22,7 @@ data ClientException = NoIdHeader |
                        InvalidTransactionHeader Command |
                        TransactionException String
 
+-- |Encapsulation of a single client's connection data
 data Connection      = Connection ClientId FrameHandler ClientTransactionManager Int
 
 instance Exception ClientException
@@ -32,7 +34,7 @@ instance Show ClientException where
     show (InvalidTransactionHeader c) = "Invalid transaction header in " ++ (show c) ++ " frame"
     show (TransactionException s)     = "Error occurred while processing transaction: " ++ s
 
--- |Set up the environment and initialize the socket loop.
+-- |Set up the environment and initialize the server loop.
 main :: IO ()
 main = do
     args        <- getArgs
@@ -108,6 +110,7 @@ handleNewConnection frameHandler frame console subManager inc = let version = de
             log console "No common protocol versions supported; rejecting connection"
             rejectConnection console frameHandler ("Supported STOMP versions are: " ++  supportedVersionsAsString)
 
+-- |Heartbeat negotation given a CONNECT frame.
 determineHeartbeats :: Frame -> (Int, Int)
 determineHeartbeats frame = 
     let (x, y) = getHeartbeat frame in
@@ -158,6 +161,7 @@ connectionLoop console subManager connection@(Connection clientId frameHandler _
                 disconnectClient connection subManager
                 return ()
 
+-- |Disconnect a client
 disconnectClient :: Connection -> SubscriptionManager -> IO UpdateResponse
 disconnectClient (Connection clientId frameHandler transactionManager _) subManager = do
     close frameHandler
@@ -187,6 +191,7 @@ handleNextFrame console subManager connection@(Connection _ frameHandler _ clien
             log console $ "There was an error parsing a client frame: " ++ (show msg)
             return Nothing
 
+-- |Handle a single frame that is not part of a transaction.
 handleSingleFrame :: Command -> Frame -> Logger -> SubscriptionManager -> Connection -> IO (Maybe Command)
 handleSingleFrame command frame console subManager connection@(Connection clientId frameHandler _ _ ) =
     case command of
@@ -213,6 +218,7 @@ handleSingleFrame command frame console subManager connection@(Connection client
             log console "Handler not yet implemented"
             return $ Just command
 
+-- |Handle a single frame that is part of a transaction.
 handleTransactionFrame :: Command -> Frame -> TransactionId -> Logger -> Connection -> IO (Maybe Command)
 handleTransactionFrame command frame txid console connection@(Connection clientId _ transactionManager _) =
     let 
@@ -259,6 +265,7 @@ getNewSub _ Nothing _ _ _ _ = throw NoIdHeader
 getNewSub (Just dest) (Just subId) ackType handler subManager clientId = do
     subscribe subManager dest clientId subId ackType handler
 
+-- |If no AckType is present, return Auto
 selectAckType :: Maybe AckType -> AckType
 selectAckType (Just ackType) = ackType
 selectAckType Nothing        = Auto
@@ -290,6 +297,7 @@ supportedVersions = ["1.2"]
 supportedVersionsAsString :: String
 supportedVersionsAsString = List.intercalate ", " supportedVersions
 
+-- |Log transform to append a string to all log messages
 appendTransform :: String -> IO String -> IO String
 appendTransform string ioString = do
     s' <- ioString
