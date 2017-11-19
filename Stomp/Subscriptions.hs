@@ -98,7 +98,6 @@ getResponseCommand (ClientAckResponse _ _ f) = getCommand f
 initManager :: IO SubscriptionManager
 initManager = do
     updateChan    <- sync newSChan
-    responseChan  <- sync newSChan
     ackChan       <- sync newSChan
     incrementer   <- newIncrementer
     subscriptions <- return $ Subscriptions HM.empty HM.empty
