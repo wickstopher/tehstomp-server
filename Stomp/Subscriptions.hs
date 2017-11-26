@@ -16,9 +16,12 @@ module Stomp.Subscriptions (
 import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
+import Prelude hiding (log)
 import Stomp.Frames hiding (subscribe, unsubscribe)
 import Stomp.Frames.IO
 import Stomp.Increment
+import Stomp.TLogger
+import System.IO
 
 -- |A unique client identifier
 type ClientId            = Integer
@@ -100,10 +103,24 @@ initManager = do
     updateChan    <- sync newSChan
     ackChan       <- sync newSChan
     incrementer   <- newIncrementer
+    initMessageCounter incrementer
     subscriptions <- return $ Subscriptions HM.empty HM.empty
     forkIO $ updateLoop updateChan ackChan subscriptions incrementer
     forkIO $ ackLoop ackChan updateChan HM.empty
     return $ SubscriptionManager updateChan
+
+initMessageCounter :: Incrementer -> IO ThreadId
+initMessageCounter inc = do
+    fileHandle   <- openFile "sentCount.log" ReadWriteMode
+    hSetBuffering fileHandle NoBuffering
+    logger       <- dateTimeLogger fileHandle
+    forkIO $ messageCountLoop inc logger 0
+
+messageCountLoop :: Incrementer -> Logger -> Integer -> IO ()
+messageCountLoop inc logger lastCount = do
+    currentCount <- sync $ timeOutEvt 1000000 `thenEvt` (\_ -> getLastEvt inc)
+    log logger $ show (currentCount - lastCount)
+    messageCountLoop inc logger currentCount
 
 -- |Subscribe to a destination; if the destination does not already exist it will be created.
 subscribe :: SubscriptionManager -> Destination -> ClientId -> SubscriptionId -> AckType -> FrameHandler -> IO ()

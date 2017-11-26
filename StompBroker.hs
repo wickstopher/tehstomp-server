@@ -37,17 +37,19 @@ instance Show ClientException where
 -- |Set up the environment and initialize the server loop.
 main :: IO ()
 main = do
-    args        <- getArgs
-    port        <- processArgs args
-    console     <- dateTimeLogger stdout
-    subManager  <- initManager
-    sock        <- socket AF_INET Stream 0
-    incrementer <- newIncrementer
+    args         <- getArgs
+    port         <- processArgs args
+    console      <- dateTimeLogger stdout
+    subManager   <- initManager
+    sock         <- socket AF_INET Stream 0
+    incrementer  <- newIncrementer
+    frameCounter <- newIncrementer
+    initFrameCounter frameCounter
     setSocketOption sock ReuseAddr 1
     bind sock (SockAddrInet port iNADDR_ANY)
     listen sock 5
     log console $ "STOMP broker initiated on port " ++ (show port)
-    socketLoop sock console subManager incrementer
+    socketLoop sock console subManager incrementer frameCounter
 
 -- |Process the command-line arguments.
 processArgs :: [String] -> IO PortNumber
@@ -55,29 +57,42 @@ processArgs (s:[]) = return $ fromIntegral ((read s)::Int)
 processArgs _      = return 2323
 
 -- |Loop as connections are received, forking off a new thread for each connection.
-socketLoop :: Socket -> Logger -> SubscriptionManager -> Incrementer -> IO ()
-socketLoop sock console subManager inc = do
+socketLoop :: Socket -> Logger -> SubscriptionManager -> Incrementer -> Incrementer -> IO ()
+socketLoop sock console subManager inc frameCounter = do
     (uSock, _) <- accept sock
     addr <- getPeerName uSock
     log console $ "New connection received from " ++ (show addr)
     handle <- socketToHandle uSock ReadWriteMode
     hSetBuffering handle NoBuffering
     frameHandler <- initFrameHandler handle
-    forkIO $ negotiateConnection frameHandler (addTransform (appendTransform ("[" ++ show addr ++ "]")) console) subManager inc
-    socketLoop sock console subManager inc
+    forkIO $ negotiateConnection frameHandler (addTransform (appendTransform ("[" ++ show addr ++ "]")) console) subManager inc frameCounter
+    socketLoop sock console subManager inc frameCounter
 
+initFrameCounter :: Incrementer -> IO ThreadId
+initFrameCounter inc = do
+    fileHandle <- openFile "frameCount.log" ReadWriteMode
+    hSetBuffering fileHandle NoBuffering
+    logger     <- dateTimeLogger fileHandle
+    forkIO $ frameCountLoop inc logger 0
+
+frameCountLoop :: Incrementer -> Logger -> Integer -> IO ()
+frameCountLoop inc logger lastCount = do
+    currentCount <- sync $ timeOutEvt 1000000 `thenEvt` (\_ -> getLastEvt inc)
+    log logger $ show (currentCount - lastCount)
+    frameCountLoop inc logger currentCount
+    
 -- |Negotiate client connection. 
-negotiateConnection :: FrameHandler -> Logger -> SubscriptionManager -> Incrementer -> IO ()
-negotiateConnection frameHandler console subManager inc = do
+negotiateConnection :: FrameHandler -> Logger -> SubscriptionManager -> Incrementer -> Incrementer -> IO ()
+negotiateConnection frameHandler console subManager inc frameCounter = do
     frameEvt <- get frameHandler
     case frameEvt of 
         NewFrame frame -> case (getCommand frame) of
             STOMP   -> do
                 log console "STOMP frame received; negotiating new connection"
-                handleNewConnection frameHandler frame console subManager inc
+                handleNewConnection frameHandler frame console subManager inc frameCounter
             CONNECT -> do
                 log console "CONNECT frame received; negotiating new connection"
-                handleNewConnection frameHandler frame console subManager inc
+                handleNewConnection frameHandler frame console subManager inc frameCounter
             _       -> do
                 log console $ (show $ getCommand frame) ++ " frame received; rejecting connection"
                 rejectConnection console frameHandler "Please initiate communications with a connection request"
@@ -89,8 +104,8 @@ negotiateConnection frameHandler console subManager inc = do
 -- |Handle a new client connection following the receipt of a CONNECT Frame. This ensures that there is a shared
 -- protocol version, and if there is, sends a CONNECTED Frame. and creates a new Unique (with respect to this 
 -- server instance) client ID, and initializes the connection loop that listens for Frames on the client's handle.
-handleNewConnection :: FrameHandler -> Frame -> Logger -> SubscriptionManager -> Incrementer -> IO ()
-handleNewConnection frameHandler frame console subManager inc = let version = determineVersion frame in
+handleNewConnection :: FrameHandler -> Frame -> Logger -> SubscriptionManager -> Incrementer -> Incrementer -> IO ()
+handleNewConnection frameHandler frame console subManager inc frameCounter = let version = determineVersion frame in
     case version of
         Just v  -> do 
             (clientSend, serverSend) <- return $ determineHeartbeats frame    
@@ -101,7 +116,7 @@ handleNewConnection frameHandler frame console subManager inc = let version = de
             transactionManager       <- initTransactionManager subManager
             log console $ "Connection initiated to client using STOMP protocol version " ++ v
             log console $ "Client unique ID is " ++ (show clientId)
-            connectionLoop console subManager $ Connection 
+            connectionLoop console subManager frameCounter $ Connection 
                 clientId 
                 frameHandler 
                 transactionManager 
@@ -146,17 +161,18 @@ getHighestSupportedVersion clientVersions =
         maybeMax mutualVersions
 
 -- |Loop, receiving and processing new Frames from the client.
-connectionLoop :: Logger -> SubscriptionManager -> Connection -> IO ()
-connectionLoop console subManager connection@(Connection clientId frameHandler _ _) = do
+connectionLoop :: Logger -> SubscriptionManager -> Incrementer -> Connection -> IO ()
+connectionLoop console subManager frameCounter connection@(Connection clientId frameHandler _ _) = do
     result <- try (handleNextFrame console subManager connection) 
         :: IO (Either SomeException (Maybe Command))
+    getNext frameCounter
     case result of
         Left exception -> do
             log console $ "There was an error processing a client frame: " ++ (show exception)
             rejectConnection console frameHandler ("Error: " ++ (show exception))
         Right command -> case command of
             Just DISCONNECT -> return ()
-            Just _          -> connectionLoop console subManager connection
+            Just _          -> connectionLoop console subManager frameCounter connection
             Nothing         -> do
                 disconnectClient connection subManager
                 return ()
