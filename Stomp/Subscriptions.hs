@@ -111,7 +111,7 @@ initManager = do
 
 initMessageCounter :: Incrementer -> IO ThreadId
 initMessageCounter inc = do
-    fileHandle   <- openFile "sentCount.log" ReadWriteMode
+    fileHandle   <- openFile "sentCount.log" AppendMode
     hSetBuffering fileHandle NoBuffering
     logger       <- dateTimeLogger fileHandle
     forkIO $ messageCountLoop inc logger 0

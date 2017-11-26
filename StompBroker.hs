@@ -70,7 +70,7 @@ socketLoop sock console subManager inc frameCounter = do
 
 initFrameCounter :: Incrementer -> IO ThreadId
 initFrameCounter inc = do
-    fileHandle <- openFile "frameCount.log" ReadWriteMode
+    fileHandle <- openFile "frameCount.log" AppendMode
     hSetBuffering fileHandle NoBuffering
     logger     <- dateTimeLogger fileHandle
     forkIO $ frameCountLoop inc logger 0
