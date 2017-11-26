@@ -1,5 +1,5 @@
 build:
-	ghc StompBroker
+	ghc StompBroker -threaded +RTS -N4
 
 docs:
 	cabal configure
@@ -9,7 +9,7 @@ install: docs
 	cabal install --enable-documentation
 
 clean:
-	rm -f StompBroker *.o *.hi Stomp/*.o Stomp/*.hi
+	rm -f StompBroker *.o *.hi *.log Stomp/*.o Stomp/*.hi
 	rm -rf dist/
 
 uninstall: clean
