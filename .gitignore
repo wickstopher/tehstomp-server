@@ -2,4 +2,4 @@ StompBroker
 *.o
 *.hi
 dist/
-
+*.log
