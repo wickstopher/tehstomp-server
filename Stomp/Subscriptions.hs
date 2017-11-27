@@ -100,12 +100,13 @@ getResponseCommand (ClientAckResponse _ _ f) = getCommand f
 -- |Initialize a SubscriptionManager and return it in an IO context.
 initManager :: IO SubscriptionManager
 initManager = do
-    updateChan    <- sync newSChan
-    ackChan       <- sync newSChan
-    incrementer   <- newIncrementer
+    updateChan      <- sync newSChan
+    lowPriorityChan <- sync newSChan
+    ackChan         <- sync newSChan
+    incrementer     <- newIncrementer
     initMessageCounter incrementer
     subscriptions <- return $ Subscriptions HM.empty HM.empty
-    forkIO $ updateLoop updateChan ackChan subscriptions incrementer
+    forkIO $ updateLoop updateChan lowPriorityChan ackChan subscriptions incrementer
     forkIO $ ackLoop ackChan updateChan HM.empty
     return $ SubscriptionManager updateChan
 
@@ -260,40 +261,40 @@ resendTimedOutFrame frame updateChan dest sentClients messageId = do
     return ()
 
 -- |State management loop for Subscriptions
-updateLoop :: SChan Update -> SChan AckUpdate -> Subscriptions -> Incrementer -> IO ()
-updateLoop updateChan ackChan subs inc = do
-        subs' <- sync $ updateEvtLoop updateChan ackChan subs inc
-        updateLoop updateChan ackChan subs' inc
+updateLoop :: SChan Update -> SChan Update -> SChan AckUpdate -> Subscriptions -> Incrementer -> IO ()
+updateLoop updateChan lowPriorityChan ackChan subs inc = do
+        subs' <- sync $ updateEvtLoop updateChan lowPriorityChan ackChan subs inc
+        updateLoop updateChan lowPriorityChan ackChan subs' inc
 
 -- |Looping event to handle the possiblility multiple subsequent transactional synchronizations in the updateLoop
-updateEvtLoop :: SChan Update -> SChan AckUpdate -> Subscriptions -> Incrementer -> Evt Subscriptions
-updateEvtLoop updateChan ackChan subs inc = do
-    update <- recvEvt updateChan
-    subs'  <- handleUpdate update subs updateChan ackChan inc
-    (alwaysEvt subs') `chooseEvt` (updateEvtLoop updateChan ackChan subs' inc)
+updateEvtLoop :: SChan Update -> SChan Update -> SChan AckUpdate -> Subscriptions -> Incrementer -> Evt Subscriptions
+updateEvtLoop updateChan lowPriorityChan ackChan subs inc = do
+    update <- (recvEvt updateChan) `chooseEvt` (timeOutEvt 100 `thenEvt` (\_ -> recvEvt lowPriorityChan))
+    subs'  <- handleUpdate update subs updateChan lowPriorityChan ackChan inc
+    (alwaysEvt subs') `chooseEvt` (updateEvtLoop updateChan lowPriorityChan ackChan subs' inc)
 
 -- |Handle an Update received in the updateLoop
-handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan AckUpdate -> Incrementer -> Evt Subscriptions
+handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan Update -> SChan AckUpdate -> Incrementer -> Evt Subscriptions
 -- Add
-handleUpdate (Add dest clientSub) subscriptions _ _ _ = do
+handleUpdate (Add dest clientSub) subscriptions _ _ _ _ = do
     return $ addSubscription dest clientSub subscriptions
 -- Remove
-handleUpdate (Remove clientId subId) subs _ _ _ = do
+handleUpdate (Remove clientId subId) subs _ _ _ _ = do
     return $ removeSubscription clientId subId subs
 -- GotMessage
-handleUpdate (GotMessage dest frame) subs updateChan ackChan inc = do
-    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs [] Nothing ackChan updateChan inc)
+handleUpdate (GotMessage dest frame) subs updateChan lowPriorityChan ackChan inc = do
+    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs [] Nothing ackChan lowPriorityChan inc)
     return subs
 -- Resend message due to NACK response
-handleUpdate (ResendMessage dest frame sentClients messageId) subs updateChan ackChan inc = do
-    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs sentClients (Just messageId) ackChan updateChan inc)
+handleUpdate (ResendMessage dest frame sentClients messageId) subs updateChan lowPriorityChan ackChan inc = do
+    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs sentClients (Just messageId) ackChan lowPriorityChan inc)
     return subs
 -- Ack response from client
-handleUpdate (Ack clientResponse) subs _ ackChan _ = do
+handleUpdate (Ack clientResponse) subs _ _ ackChan _ = do
     sendEvt ackChan (Response clientResponse)
     return subs
 -- Client disconnected
-handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests) _ ackChan _ = do
+handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests) _ _ ackChan _ = do
     sendEvt ackChan (ClientDisconnected clientId)
     return $ removeAllClientSubs subs clientId
 
