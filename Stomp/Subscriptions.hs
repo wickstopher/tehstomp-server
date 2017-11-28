@@ -38,6 +38,8 @@ type Destination         = String
 -- |A HashMap to keep track of subscriptions to a given Destination.
 type SubMap              = HashMap Destination (HashMap ClientId ClientSub)
 
+type UnsentUpdates       = HashMap Destination [Update]
+
 -- |A HashMap to track which ClientId/SubscriptionId pairs are on which Destination. Allows for
 --  efficient removal of client subscriptions, as a client UNSUBSCRIBE frame only contains the
 --  SubscriptionId, not the Destination.
@@ -53,7 +55,7 @@ type AckContextMap       = HashMap MessageId AckContext
 type ClientAcks          = HashMap ClientId (AckContextMap, AckResponseMap)
 
 -- |Encapsulation of all subascription data
-data Subscriptions       = Subscriptions SubMap ClientDests
+data Subscriptions       = Subscriptions SubMap ClientDests UnsentUpdates
 
 -- |A ClientSub encapsulates information about a client subscription.
 data ClientSub           = ClientSub ClientId SubscriptionId AckType FrameHandler
@@ -74,12 +76,25 @@ data Update              = Add Destination ClientSub |
                            Remove ClientId SubscriptionId |
                            GotMessage Destination Frame |
                            ResendMessage Destination Frame [ClientId] MessageId |
+                           TimeOut Destination Frame [ClientId] MessageId |
                            Ack ClientAckResponse |
-                           Disconnected ClientId
+                           Disconnected ClientId deriving Show
 
 -- |The SubscriptionManager allows the server to add and remove new subscriptions, send messages 
 -- to destinations, and send ACK/NACK responses.
 data SubscriptionManager = SubscriptionManager (SChan Update)
+
+instance Show ClientSub where
+    show _ = "clientsub"
+
+instance Show ClientAckResponse where
+    show _ = "ackresponse"
+
+
+showUnsent :: UnsentUpdates -> String
+showUnsent x = Prelude.foldr (++) ""  (Prelude.map showOneUnsent (toList x))
+
+showOneUnsent (k, v) = (show k) ++ ": " ++ (show $ length v) ++ "\n"
 
 -- |Conveninece function to get the ClientId from a ClientSub
 getSubClientId :: ClientSub -> ClientId
@@ -104,7 +119,7 @@ initManager = do
     ackChan       <- sync newSChan
     incrementer   <- newIncrementer
     initMessageCounter incrementer
-    subscriptions <- return $ Subscriptions HM.empty HM.empty
+    subscriptions <- return $ Subscriptions HM.empty HM.empty HM.empty
     forkIO $ updateLoop updateChan ackChan subscriptions incrementer
     forkIO $ ackLoop ackChan updateChan HM.empty
     return $ SubscriptionManager updateChan
@@ -125,7 +140,9 @@ messageCountLoop inc logger lastCount = do
 -- |Subscribe to a destination; if the destination does not already exist it will be created.
 subscribe :: SubscriptionManager -> Destination -> ClientId -> SubscriptionId -> AckType -> FrameHandler -> IO ()
 subscribe (SubscriptionManager updateChan) destination clientId subId ackType frameHandler = do
+    putStrLn "SUBSCRIBING SON!@"
     sync $ sendEvt updateChan $ Add destination $ ClientSub clientId subId ackType frameHandler
+    putStrLn "SUBSCRIBED!!!"
 
 -- |Unsubscribe from a destination.
 unsubscribe :: SubscriptionManager -> ClientId -> SubscriptionId -> IO ()
@@ -256,13 +273,15 @@ resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
 -- |Resend a Frame whose send timed out (possibly due to no active subscribers)
 resendTimedOutFrame :: Frame -> SChan Update -> Destination -> [ClientId] -> MessageId -> IO ()
 resendTimedOutFrame frame updateChan dest sentClients messageId = do
-    forkIO $ sync $ sendEvt updateChan $ ResendMessage dest frame sentClients messageId
+    forkIO $ sync $ sendEvt updateChan $ TimeOut dest frame sentClients messageId
     return ()
 
 -- |State management loop for Subscriptions
 updateLoop :: SChan Update -> SChan AckUpdate -> Subscriptions -> Incrementer -> IO ()
 updateLoop updateChan ackChan subs inc = do
+        putStrLn $ "Before : " ++ (showUnsent $ getUnsent subs)
         subs' <- sync $ updateEvtLoop updateChan ackChan subs inc
+        putStrLn $ "After : " ++ (showUnsent $ getUnsent subs)
         updateLoop updateChan ackChan subs' inc
 
 -- |Looping event to handle the possiblility multiple subsequent transactional synchronizations in the updateLoop
@@ -272,11 +291,14 @@ updateEvtLoop updateChan ackChan subs inc = do
     subs'  <- handleUpdate update subs updateChan ackChan inc
     (alwaysEvt subs') `chooseEvt` (updateEvtLoop updateChan ackChan subs' inc)
 
+getUnsent :: Subscriptions -> UnsentUpdates
+getUnsent (Subscriptions _ _ unsent) = unsent
+
 -- |Handle an Update received in the updateLoop
 handleUpdate :: Update -> Subscriptions -> SChan Update -> SChan AckUpdate -> Incrementer -> Evt Subscriptions
 -- Add
-handleUpdate (Add dest clientSub) subscriptions _ _ _ = do
-    return $ addSubscription dest clientSub subscriptions
+handleUpdate (Add dest clientSub) subscriptions updateChan _ _ = do
+    addSubscription dest clientSub subscriptions updateChan
 -- Remove
 handleUpdate (Remove clientId subId) subs _ _ _ = do
     return $ removeSubscription clientId subId subs
@@ -293,14 +315,22 @@ handleUpdate (Ack clientResponse) subs _ ackChan _ = do
     sendEvt ackChan (Response clientResponse)
     return subs
 -- Client disconnected
-handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests) _ ackChan _ = do
+handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests _) _ ackChan _ = do
     sendEvt ackChan (ClientDisconnected clientId)
     return $ removeAllClientSubs subs clientId
+-- Frame send timed out
+handleUpdate (TimeOut dest frame sentClients messageId) (Subscriptions subMap clientDests unsent) updateChan ackChan inc = 
+    let unsentUpdate = (ResendMessage dest frame sentClients messageId)
+        destUnsentList = case HM.lookup dest unsent of
+            Just messageList -> unsentUpdate : messageList
+            Nothing          -> [unsentUpdate]
+    in
+        return $ Subscriptions subMap clientDests (HM.insert dest destUnsentList unsent)
 
 -- |Remove all subscriptions for the given ClientId from the Subscriptions
 removeAllClientSubs :: Subscriptions -> ClientId -> Subscriptions
-removeAllClientSubs subs@(Subscriptions subMap clientDests) clientId = case HM.lookup clientId clientDests of
-    Just destMap -> Subscriptions (deleteSubs subMap clientId (elems destMap)) (HM.delete clientId clientDests)
+removeAllClientSubs subs@(Subscriptions subMap clientDests unsent) clientId = case HM.lookup clientId clientDests of
+    Just destMap -> Subscriptions (deleteSubs subMap clientId (elems destMap)) (HM.delete clientId clientDests) unsent
     Nothing      -> subs
 
 -- |Delete all subscriptions from the SubMap
@@ -311,33 +341,44 @@ deleteSubs subMap clientId (dest:rest) = case HM.lookup dest subMap of
     Nothing         -> deleteSubs subMap clientId rest
 
 -- |Add a new Subscription to the given Destination
-addSubscription :: Destination -> ClientSub -> Subscriptions -> Subscriptions
-addSubscription dest clientSub@(ClientSub clientId subId _ _) (Subscriptions subMap clientDests) =
+addSubscription :: Destination -> ClientSub -> Subscriptions -> SChan Update -> Evt Subscriptions
+addSubscription dest clientSub@(ClientSub clientId subId _ _) (Subscriptions subMap clientDests unsent) updateChan =
     let clientSubs' = case HM.lookup dest subMap of
-            Just clientSubs -> HM.insert clientId clientSub clientSubs
-            Nothing         -> HM.singleton clientId clientSub
+            Just clientSubs  -> HM.insert clientId clientSub clientSubs
+            Nothing          -> HM.singleton clientId clientSub
         destMap'    = case HM.lookup clientId clientDests of
-            Just destMap    -> HM.insert subId dest destMap
-            Nothing         -> HM.singleton subId dest
-    in
-        Subscriptions (insert dest clientSubs' subMap) (insert clientId destMap' clientDests)
+            Just destMap     -> HM.insert subId dest destMap
+            Nothing          -> HM.singleton subId dest
+    in do
+        case HM.lookup dest unsent of
+            Just messageList -> do
+                forkEvt (alwaysEvt ()) (\_ -> resendMessages updateChan (reverse messageList))
+                return ()
+            Nothing -> return ()
+        return $ Subscriptions (insert dest clientSubs' subMap) (insert clientId destMap' clientDests) (HM.delete dest unsent)
+
+resendMessages :: SChan Update -> [Update] -> IO ()
+resendMessages _ [] = return ()
+resendMessages updateChan (x:xs) = do
+    sync $ sendEvt updateChan x
+    resendMessages updateChan xs
 
 -- |Remove the given SubscriptionId for the given ClientId
 removeSubscription :: ClientId -> SubscriptionId -> Subscriptions -> Subscriptions
-removeSubscription clientId subId subs@(Subscriptions subMap clientDests) =
+removeSubscription clientId subId subs@(Subscriptions subMap clientDests unsent) =
     case HM.lookup clientId clientDests of
         Just destMap ->
             let clientDests' = HM.insert clientId (HM.delete subId destMap) clientDests
             in case HM.lookup subId destMap of 
                 Just dest -> case HM.lookup dest subMap of
-                    Just clientSubs -> Subscriptions (HM.insert dest (HM.delete clientId clientSubs) subMap) clientDests'
-                    Nothing         -> Subscriptions subMap clientDests'
-                Nothing          -> Subscriptions subMap clientDests'
+                    Just clientSubs -> Subscriptions (HM.insert dest (HM.delete clientId clientSubs) subMap) clientDests' unsent
+                    Nothing         -> Subscriptions subMap clientDests' unsent
+                Nothing          -> Subscriptions subMap clientDests' unsent
         Nothing -> subs
 
 -- |Handle a SEND Frame for the given Destination
 handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan AckUpdate -> SChan Update -> Incrementer -> IO ()
-handleMessage frame dest subs@(Subscriptions subMap _) sentClients maybeId ackChan updateChan inc =
+handleMessage frame dest subs@(Subscriptions subMap _ _) sentClients maybeId ackChan updateChan inc =
     case HM.lookup dest subMap of
         Just clientSubs -> do
             messageId    <- getNewMessageId maybeId inc -- If this is not a resend, it gets a new messageId (TODO: re-evaluate; maybe we just want a new id for each message regardless)
