@@ -75,8 +75,9 @@ data AckUpdate           = Response ClientAckResponse | Context AckContext | Cli
 data Update              = Add Destination ClientSub |
                            Remove ClientId SubscriptionId |
                            GotMessage Destination Frame |
-                           ResendMessage Destination Frame [ClientId] MessageId |
+                           ResendMessage Destination Frame [ClientId] (Maybe MessageId) |
                            TimeOut Destination Frame [ClientId] MessageId |
+                           NoSubscribers Destination Frame |
                            Ack ClientAckResponse |
                            Disconnected ClientId deriving Show
 
@@ -267,7 +268,7 @@ handleNack contexts updateChan = mapM_ (resendContextFrame updateChan) contexts
 --- |Resend a Frame from an AckContext
 resendContextFrame :: SChan Update -> AckContext -> IO ()
 resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
-    sync $ sendEvt updateChan $ ResendMessage (_getDestination frame) frame sentClients msgId
+    sync $ sendEvt updateChan $ ResendMessage (_getDestination frame) frame sentClients (Just msgId)
     return ()
 
 -- |Resend a Frame whose send timed out (possibly due to no active subscribers)
@@ -308,7 +309,7 @@ handleUpdate (GotMessage dest frame) subs updateChan ackChan inc = do
     return subs
 -- Resend message due to NACK response
 handleUpdate (ResendMessage dest frame sentClients messageId) subs updateChan ackChan inc = do
-    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs sentClients (Just messageId) ackChan updateChan inc)
+    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs sentClients messageId ackChan updateChan inc)
     return subs
 -- Ack response from client
 handleUpdate (Ack clientResponse) subs _ ackChan _ = do
@@ -320,12 +321,20 @@ handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests _) _
     return $ removeAllClientSubs subs clientId
 -- Frame send timed out
 handleUpdate (TimeOut dest frame sentClients messageId) (Subscriptions subMap clientDests unsent) updateChan ackChan inc = 
-    let unsentUpdate = (ResendMessage dest frame sentClients messageId)
+    let unsentUpdate = (ResendMessage dest frame sentClients (Just messageId))
         destUnsentList = case HM.lookup dest unsent of
             Just messageList -> unsentUpdate : messageList
             Nothing          -> [unsentUpdate]
     in
         return $ Subscriptions subMap clientDests (HM.insert dest destUnsentList unsent)
+handleUpdate (NoSubscribers dest frame) (Subscriptions subMap clientDests unsent) updateChan ackChan inc = 
+    let unsentUpdate = (ResendMessage dest frame [] Nothing)
+        destUnsentList = case HM.lookup dest unsent of
+            Just messageList -> unsentUpdate : messageList
+            Nothing          -> [unsentUpdate]
+    in
+        return $ Subscriptions subMap clientDests (HM.insert dest destUnsentList unsent)
+
 
 -- |Remove all subscriptions for the given ClientId from the Subscriptions
 removeAllClientSubs :: Subscriptions -> ClientId -> Subscriptions
@@ -395,7 +404,7 @@ handleMessage frame dest subs@(Subscriptions subMap _ _) sentClients maybeId ack
                             return ()
                 -- If no Subscription synchronized on the send due to a timeout, trigger a resend
                 Nothing -> do { forkIO $ resendTimedOutFrame frame updateChan dest sentClients messageId ; return () }
-        Nothing -> return ()
+        Nothing -> do { forkIO $ sync $ sendEvt updateChan (NoSubscribers dest frame) ; return () }
 
 getNewMessageId :: Maybe MessageId -> Incrementer -> IO MessageId
 getNewMessageId maybeId inc = case maybeId of
