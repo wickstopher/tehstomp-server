@@ -141,9 +141,7 @@ messageCountLoop inc logger lastCount = do
 -- |Subscribe to a destination; if the destination does not already exist it will be created.
 subscribe :: SubscriptionManager -> Destination -> ClientId -> SubscriptionId -> AckType -> FrameHandler -> IO ()
 subscribe (SubscriptionManager updateChan) destination clientId subId ackType frameHandler = do
-    putStrLn "SUBSCRIBING SON!@"
     sync $ sendEvt updateChan $ Add destination $ ClientSub clientId subId ackType frameHandler
-    putStrLn "SUBSCRIBED!!!"
 
 -- |Unsubscribe from a destination.
 unsubscribe :: SubscriptionManager -> ClientId -> SubscriptionId -> IO ()
@@ -304,13 +302,26 @@ handleUpdate (Add dest clientSub) subscriptions updateChan _ _ = do
 handleUpdate (Remove clientId subId) subs _ _ _ = do
     return $ removeSubscription clientId subId subs
 -- GotMessage
-handleUpdate (GotMessage dest frame) subs updateChan ackChan inc = do
-    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs [] Nothing ackChan updateChan inc)
-    return subs
+handleUpdate (GotMessage dest frame) subs@(Subscriptions subMap _ _) updateChan ackChan inc =
+    case HM.lookup dest subMap of 
+        Just clientSubs ->  
+            if HM.size clientSubs > 0 then do 
+                forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs [] Nothing ackChan updateChan inc)
+                return subs
+            else
+                return $ updateUnsent subs dest (ResendMessage dest frame [] Nothing)
+        Nothing -> return $ updateUnsent subs dest (ResendMessage dest frame [] Nothing)
+
 -- Resend message due to NACK response
-handleUpdate (ResendMessage dest frame sentClients messageId) subs updateChan ackChan inc = do
-    forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs sentClients messageId ackChan updateChan inc)
-    return subs
+handleUpdate update@(ResendMessage dest frame sentClients messageId) subs@(Subscriptions subMap _ _) updateChan ackChan inc =
+    case HM.lookup dest subMap of
+        Just clientSubs ->
+            if HM.size clientSubs > 0 then do
+                forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs sentClients messageId ackChan updateChan inc)
+                return subs
+            else
+                return $ updateUnsent subs dest update
+        Nothing -> return $ updateUnsent subs dest update
 -- Ack response from client
 handleUpdate (Ack clientResponse) subs _ ackChan _ = do
     sendEvt ackChan (Response clientResponse)
@@ -320,21 +331,15 @@ handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests _) _
     sendEvt ackChan (ClientDisconnected clientId)
     return $ removeAllClientSubs subs clientId
 -- Frame send timed out
-handleUpdate (TimeOut dest frame sentClients messageId) (Subscriptions subMap clientDests unsent) updateChan ackChan inc = 
-    let unsentUpdate = (ResendMessage dest frame sentClients (Just messageId))
-        destUnsentList = case HM.lookup dest unsent of
-            Just messageList -> unsentUpdate : messageList
-            Nothing          -> [unsentUpdate]
-    in
-        return $ Subscriptions subMap clientDests (HM.insert dest destUnsentList unsent)
-handleUpdate (NoSubscribers dest frame) (Subscriptions subMap clientDests unsent) updateChan ackChan inc = 
-    let unsentUpdate = (ResendMessage dest frame [] Nothing)
-        destUnsentList = case HM.lookup dest unsent of
-            Just messageList -> unsentUpdate : messageList
-            Nothing          -> [unsentUpdate]
-    in
-        return $ Subscriptions subMap clientDests (HM.insert dest destUnsentList unsent)
+handleUpdate (TimeOut dest frame sentClients messageId) subs updateChan ackChan inc = 
+    return $ updateUnsent subs dest (ResendMessage dest frame sentClients (Just messageId))
 
+updateUnsent :: Subscriptions -> Destination -> Update -> Subscriptions
+updateUnsent (Subscriptions subMap clientDests unsent) dest update = 
+    let messageList' = case HM.lookup dest unsent of
+            Just messageList -> update : messageList
+            Nothing          -> [update]
+    in Subscriptions subMap clientDests (HM.insert dest messageList' unsent)
 
 -- |Remove all subscriptions for the given ClientId from the Subscriptions
 removeAllClientSubs :: Subscriptions -> ClientId -> Subscriptions
@@ -388,23 +393,21 @@ removeSubscription clientId subId subs@(Subscriptions subMap clientDests unsent)
 -- |Handle a SEND Frame for the given Destination
 handleMessage :: Frame -> Destination -> Subscriptions -> [ClientId] -> Maybe MessageId -> SChan AckUpdate -> SChan Update -> Incrementer -> IO ()
 handleMessage frame dest subs@(Subscriptions subMap _ _) sentClients maybeId ackChan updateChan inc =
-    case HM.lookup dest subMap of
-        Just clientSubs -> do
-            messageId    <- getNewMessageId maybeId inc -- If this is not a resend, it gets a new messageId (TODO: re-evaluate; maybe we just want a new id for each message regardless)
-            frame'       <- return $ addFrameHeaderFront (messageIdHeader (show messageId)) frame
-            maybeSub     <- sync $ clientChoiceEvt frame' messageId sentClients clientSubs
-            case maybeSub of
-                Just clientSub -> do
-                    clientId     <- return $ getSubClientId clientSub
-                    context      <- return $ AckContext frame messageId clientId (getSubAckType clientSub) (clientId:sentClients)
-                    case (getSubAckType clientSub) of
-                        Auto -> return ()
-                        _    -> do
-                            forkIO $ sync $ sendEvt ackChan (Context context)
-                            return ()
-                -- If no Subscription synchronized on the send due to a timeout, trigger a resend
-                Nothing -> do { forkIO $ resendTimedOutFrame frame updateChan dest sentClients messageId ; return () }
-        Nothing -> do { forkIO $ sync $ sendEvt updateChan (NoSubscribers dest frame) ; return () }
+    let clientSubs = subMap HM.! dest in do
+        messageId    <- getNewMessageId maybeId inc -- If this is not a resend, it gets a new messageId (TODO: re-evaluate; maybe we just want a new id for each message regardless)
+        frame'       <- return $ addFrameHeaderFront (messageIdHeader (show messageId)) frame
+        maybeSub     <- sync $ clientChoiceEvt frame' messageId sentClients clientSubs
+        case maybeSub of
+            Just clientSub -> do
+                clientId     <- return $ getSubClientId clientSub
+                context      <- return $ AckContext frame messageId clientId (getSubAckType clientSub) (clientId:sentClients)
+                case (getSubAckType clientSub) of
+                    Auto -> return ()
+                    _    -> do
+                        forkIO $ sync $ sendEvt ackChan (Context context)
+                        return ()
+            -- If no Subscription synchronized on the send due to a timeout, trigger a resend
+            Nothing -> do { forkIO $ resendTimedOutFrame frame updateChan dest sentClients messageId ; return () }
 
 getNewMessageId :: Maybe MessageId -> Incrementer -> IO MessageId
 getNewMessageId maybeId inc = case maybeId of
