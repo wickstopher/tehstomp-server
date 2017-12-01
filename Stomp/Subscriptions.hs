@@ -16,6 +16,7 @@ module Stomp.Subscriptions (
 import Control.Concurrent
 import Control.Concurrent.TxEvent
 import Data.HashMap.Strict as HM
+import Data.List
 import Prelude hiding (log)
 import Stomp.Frames hiding (subscribe, unsubscribe)
 import Stomp.Frames.IO
@@ -86,14 +87,14 @@ data Update              = Add Destination ClientSub |
 data SubscriptionManager = SubscriptionManager (SChan Update)
 
 instance Show ClientSub where
-    show _ = "clientsub"
+    show _ = "ClientSub"
 
 instance Show ClientAckResponse where
-    show _ = "ackresponse"
-
+    show _ = "ClientAckResponse"
 
 showUnsent :: UnsentUpdates -> String
-showUnsent x = Prelude.foldr (++) ""  (Prelude.map showOneUnsent (toList x))
+showUnsent x = "Unsent messages on destinations:\n" 
+    ++ (Prelude.foldr (++) ""  (Prelude.map showOneUnsent (toList x)))
 
 showOneUnsent (k, v) = (show k) ++ ": " ++ (show $ length v) ++ "\n"
 
@@ -278,9 +279,8 @@ resendTimedOutFrame frame updateChan dest sentClients messageId = do
 -- |State management loop for Subscriptions
 updateLoop :: SChan Update -> SChan AckUpdate -> Subscriptions -> Incrementer -> IO ()
 updateLoop updateChan ackChan subs inc = do
-        putStrLn $ "Before : " ++ (showUnsent $ getUnsent subs)
+        putStrLn $ (showUnsent $ getUnsent subs)
         subs' <- sync $ updateEvtLoop updateChan ackChan subs inc
-        putStrLn $ "After : " ++ (showUnsent $ getUnsent subs)
         updateLoop updateChan ackChan subs' inc
 
 -- |Looping event to handle the possiblility multiple subsequent transactional synchronizations in the updateLoop
@@ -311,7 +311,6 @@ handleUpdate (GotMessage dest frame) subs@(Subscriptions subMap _ _) updateChan 
             else
                 return $ updateUnsent subs dest (ResendMessage dest frame [] Nothing)
         Nothing -> return $ updateUnsent subs dest (ResendMessage dest frame [] Nothing)
-
 -- Resend message due to NACK response
 handleUpdate update@(ResendMessage dest frame sentClients messageId) subs@(Subscriptions subMap _ _) updateChan ackChan inc =
     case HM.lookup dest subMap of
@@ -331,8 +330,14 @@ handleUpdate (Disconnected clientId) subs@(Subscriptions subMap clientDests _) _
     sendEvt ackChan (ClientDisconnected clientId)
     return $ removeAllClientSubs subs clientId
 -- Frame send timed out
-handleUpdate (TimeOut dest frame sentClients messageId) subs updateChan ackChan inc = 
-    return $ updateUnsent subs dest (ResendMessage dest frame sentClients (Just messageId))
+handleUpdate (TimeOut dest frame sentClients messageId) subs@(Subscriptions subMap _ _) updateChan ackChan inc = 
+    case HM.lookup dest subMap of
+        Just clientSubs ->
+            if HM.size clientSubs > 0 && length ((keys clientSubs) \\ sentClients) > 0 then do
+                forkEvt (alwaysEvt ()) (\_ -> do { handleMessage frame dest subs sentClients (Just messageId) ackChan updateChan inc })
+                return subs
+            else do
+                return $ updateUnsent subs dest (ResendMessage dest frame sentClients (Just messageId))
 
 updateUnsent :: Subscriptions -> Destination -> Update -> Subscriptions
 updateUnsent (Subscriptions subMap clientDests unsent) dest update = 
@@ -369,7 +374,7 @@ addSubscription dest clientSub@(ClientSub clientId subId _ _) (Subscriptions sub
                 forkEvt (alwaysEvt ()) (\_ -> resendMessages updateChan (reverse messageList))
                 return ()
             Nothing -> return ()
-        return $ Subscriptions (insert dest clientSubs' subMap) (insert clientId destMap' clientDests) (HM.delete dest unsent)
+        return $ Subscriptions (HM.insert dest clientSubs' subMap) (HM.insert clientId destMap' clientDests) (HM.delete dest unsent)
 
 resendMessages :: SChan Update -> [Update] -> IO ()
 resendMessages _ [] = return ()
