@@ -172,7 +172,9 @@ ackResponseEvt (SubscriptionManager updateChan) clientId frame =
 -- |Report a client disconnect
 clientDisconnected :: SubscriptionManager -> ClientId -> IO ()
 clientDisconnected (SubscriptionManager updateChan) clientId = do
+    putStrLn "HERE"
     sync $ sendEvt updateChan $ Disconnected clientId
+    putStrLn "EDONE"
 
 -- |State management loop for ClientAcks
 ackLoop :: SChan AckUpdate -> SChan Update -> ClientAcks -> IO ()
@@ -218,13 +220,20 @@ handleAckContext context@(AckContext frame msgId clientId ackType sentClients) c
 handleClientDisconnect :: ClientAcks -> ClientId -> SChan Update -> Evt ClientAcks
 handleClientDisconnect clientAcks clientId updateChan = case HM.lookup clientId clientAcks of
     Just (contextMap, _) -> do
-        mapM_ (resendContext updateChan) contextMap
+        --mapM_ (resendContext updateChan) contextMap
+        forkEvt (alwaysEvt ()) (\_ -> handleNack (elems contextMap) updateChan)
         return $ HM.delete clientId clientAcks
     Nothing              -> return clientAcks
 
 -- |Resend an AckContext
 resendContext :: SChan Update -> AckContext -> Evt ThreadId
 resendContext updateChan ackContext = forkEvt (alwaysEvt ()) (\_ -> resendContextFrame updateChan ackContext)
+
+--- |Resend a Frame from an AckContext
+resendContextFrame :: SChan Update -> AckContext -> IO ()
+resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
+    sync $ sendEvt updateChan $ ResendMessage (_getDestination frame) frame sentClients (Just msgId)
+    return ()
 
 -- |Handle an AckContext with the Command received in response from the client (NACK or ACK)
 handleAckPair :: AckContext -> Command -> ClientAcks -> SChan Update -> AckContextMap -> AckResponseMap -> Evt ClientAcks
@@ -263,12 +272,6 @@ filterGtKeys n = HM.filterWithKey (\k -> \_ -> k <= n)
 -- |Resend all frames in the list of AckContexts
 handleNack :: [AckContext] -> SChan Update -> IO ()
 handleNack contexts updateChan = mapM_ (resendContextFrame updateChan) contexts
-
---- |Resend a Frame from an AckContext
-resendContextFrame :: SChan Update -> AckContext -> IO ()
-resendContextFrame updateChan (AckContext frame msgId _ _ sentClients) = do
-    sync $ sendEvt updateChan $ ResendMessage (_getDestination frame) frame sentClients (Just msgId)
-    return ()
 
 -- |Resend a Frame whose send timed out (possibly due to no active subscribers)
 resendTimedOutFrame :: Frame -> SChan Update -> Destination -> [ClientId] -> MessageId -> IO ()
@@ -315,7 +318,7 @@ handleUpdate (GotMessage dest frame) subs@(Subscriptions subMap _ _) updateChan 
 handleUpdate update@(ResendMessage dest frame sentClients messageId) subs@(Subscriptions subMap _ _) updateChan ackChan inc =
     case HM.lookup dest subMap of
         Just clientSubs ->
-            if HM.size clientSubs > 0 then do
+            if HM.size clientSubs > 0  && length ((keys clientSubs) \\ sentClients) > 0 then do
                 forkEvt (alwaysEvt ()) (\_ -> handleMessage frame dest subs sentClients messageId ackChan updateChan inc)
                 return subs
             else
@@ -336,7 +339,7 @@ handleUpdate (TimeOut dest frame sentClients messageId) subs@(Subscriptions subM
             if HM.size clientSubs > 0 && length ((keys clientSubs) \\ sentClients) > 0 then do
                 forkEvt (alwaysEvt ()) (\_ -> do { handleMessage frame dest subs sentClients (Just messageId) ackChan updateChan inc })
                 return subs
-            else do
+            else
                 return $ updateUnsent subs dest (ResendMessage dest frame sentClients (Just messageId))
 
 updateUnsent :: Subscriptions -> Destination -> Update -> Subscriptions

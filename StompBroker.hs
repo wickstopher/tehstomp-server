@@ -191,7 +191,7 @@ handleNextFrame console subManager connection@(Connection _ frameHandler _ clien
     case frameEvt of 
         NewFrame frame -> do
             command <- return $ getCommand frame
-            log console $ "Received " ++ (show command) ++ " frame"
+            --log console $ "Received " ++ (show command) ++ " frame"
             handleReceiptRequest frameHandler frame console
             case (getTransaction frame) of
                 Just txid -> handleTransactionFrame command frame txid console connection
