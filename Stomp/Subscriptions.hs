@@ -172,9 +172,7 @@ ackResponseEvt (SubscriptionManager updateChan) clientId frame =
 -- |Report a client disconnect
 clientDisconnected :: SubscriptionManager -> ClientId -> IO ()
 clientDisconnected (SubscriptionManager updateChan) clientId = do
-    putStrLn "HERE"
     sync $ sendEvt updateChan $ Disconnected clientId
-    putStrLn "EDONE"
 
 -- |State management loop for ClientAcks
 ackLoop :: SChan AckUpdate -> SChan Update -> ClientAcks -> IO ()
