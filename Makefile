@@ -6,7 +6,7 @@ docs:
 	cabal haddock
 
 install: docs
-	cabal install --enable-documentation
+	cabal install --enable-documentation --force-reinstalls
 
 clean:
 	rm -f StompBroker *.o *.hi *.log Stomp/*.o Stomp/*.hi
